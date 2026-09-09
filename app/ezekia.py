@@ -42,7 +42,9 @@ the sample deck's status labels — confirm/adjust them against a real assignmen
 from __future__ import annotations
 
 import os
+import random
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -298,27 +300,49 @@ def _enrich_profile_candidates(client, base_url: str, candidates: List[Dict[str,
     if limit is not None:
         targets = targets[:limit]
 
-    summary = {"profile_candidates": len(targets), "calls": 0, "errors": 0}
+    summary: Dict[str, Any] = {"profile_candidates": len(targets), "calls": 0,
+                               "errors": 0, "status_counts": {}}
     if not targets:
         return summary
 
     by_id = {_person_id(c): c for c in targets}
 
     def fetch(pid, field):
-        try:
-            r = client.get(f"{base_url}/v4/people/{pid}", params=[("fields", field)])
+        """Fetch one block, retrying on rate-limit / transient errors. Returns
+        (pid, profile_or_None, last_status)."""
+        last_status = -1
+        for attempt in range(4):
+            try:
+                r = client.get(f"{base_url}/v4/people/{pid}",
+                               params=[("fields", field)], timeout=30.0)
+            except Exception:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            last_status = r.status_code
             if r.status_code == 200:
-                return pid, ((r.json() or {}).get("data", {}) or {}).get("profile") or {}
-            return pid, None
-        except Exception:
-            return pid, None
+                return pid, (((r.json() or {}).get("data", {}) or {}).get("profile") or {}), 200
+            if r.status_code in (429, 500, 502, 503, 504):
+                ra = r.headers.get("Retry-After", "")
+                try:
+                    delay = float(ra) if ra else 0.0
+                except ValueError:
+                    delay = 0.0
+                if not delay:
+                    delay = 0.8 * (attempt + 1) + random.random() * 0.5
+                time.sleep(min(delay, 6.0))
+                continue
+            break  # non-retryable (e.g. 403 permission, 404)
+        return pid, None, last_status
 
     tasks = [(pid, field) for pid in by_id for field in PERSON_PROFILE_FIELDS]
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    # modest concurrency to avoid tripping Ezekia's rate limiter
+    with ThreadPoolExecutor(max_workers=4) as ex:
         futures = [ex.submit(fetch, pid, field) for pid, field in tasks]
         for fut in as_completed(futures):
             summary["calls"] += 1
-            pid, block = fut.result()
+            pid, block, status = fut.result()
+            sc = summary["status_counts"]
+            sc[str(status)] = sc.get(str(status), 0) + 1
             if block is None:
                 summary["errors"] += 1
                 continue
@@ -773,28 +797,33 @@ def _profile_field_probe(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _person_shape_probe(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """For the first FULL-PROFILE candidate, report key paths of links /
-    currentStatus / education so we can confirm where LinkedIn lives and why a
-    location may be private. KEY PATHS ONLY — no personal values."""
-    sample = None
-    for it in items:
-        r = _candidate_route(it)
-        if r is not None and r[2]:
-            sample = it
-            break
-    if sample is None:
-        return {"note": "no full-profile candidate found"}
-    prof = sample.get("profile") or {}
-    cur_locs = _g(prof, "currentStatus", "locations", default=[]) or []
-    first_loc = cur_locs[0] if cur_locs and isinstance(cur_locs[0], dict) else None
-    return {
-        "links_paths": _key_paths(sample.get("links") or [])[:20],
-        "currentStatus_paths": _key_paths(_g(prof, "currentStatus", default={}) or {})[:30],
-        "education_paths": _key_paths(_g(prof, "education", default=[]) or [])[:30],
-        "linkedin_found": bool(_linkedin_url(sample, prof)),
-        "location_found": bool(_location(sample, prof)),
-        "first_location_marked_private": _is_private_loc(first_loc),
-    }
+    """Report KEY PATHS (no values) of links / currentStatus / confidential /
+    education, each from the first profile candidate that actually has that
+    block — so we can confirm where LinkedIn and salary live and see the
+    education shape, even when enrichment only populated a few candidates."""
+    def first_profile(pred):
+        for it in items:
+            r = _candidate_route(it)
+            if r is not None and r[2] and pred(it):
+                return it
+        return None
+
+    any_c = first_profile(lambda it: True)
+    cs = first_profile(lambda it: _g(it, "profile", "currentStatus"))
+    cf = first_profile(lambda it: _g(it, "profile", "confidential"))
+    ed = first_profile(lambda it: _g(it, "profile", "education"))
+
+    out: Dict[str, Any] = {}
+    if any_c is not None:
+        out["links_paths"] = _key_paths(any_c.get("links") or [])[:20]
+        out["linkedin_found"] = bool(_linkedin_url(any_c, any_c.get("profile") or {}))
+    out["currentStatus_paths"] = (_key_paths(_g(cs, "profile", "currentStatus", default={}) or {})[:40]
+                                  if cs else "none fetched")
+    out["confidential_paths"] = (_key_paths(_g(cf, "profile", "confidential", default={}) or {})[:40]
+                                 if cf else "none fetched")
+    out["education_paths"] = (_key_paths(_g(ed, "profile", "education", default=[]) or [])[:40]
+                              if ed else "none fetched")
+    return out
 
 
 def _profile_fill_summary(items: List[Dict[str, Any]]) -> Dict[str, int]:
