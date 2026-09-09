@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Praeva Search Update Generator</title>
+<style>
+  :root{
+    --pink:#f22e8f; --pink-soft:#ffe6f2; --cream:#fbf9ef; --ink:#141414;
+    --line:#e6e3d6; --muted:#6b6b6b; --green:#0f7a5a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--cream);color:var(--ink);min-height:100vh;display:flex;flex-direction:column}
+  header{padding:22px 28px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px}
+  .logo{font-weight:800;letter-spacing:.14em;font-size:20px}
+  .logo b{color:var(--pink)}
+  header .tag{color:var(--muted);font-size:13px}
+  main{flex:1;display:flex;justify-content:center;padding:48px 20px}
+  .card{width:100%;max-width:640px}
+  h1{font-size:26px;margin:0 0 6px}
+  p.lead{color:var(--muted);margin:0 0 28px;line-height:1.5}
+  label{display:block;font-weight:600;font-size:14px;margin-bottom:8px}
+  .row{display:flex;gap:10px}
+  input[type=text]{flex:1;padding:14px 16px;border:1px solid var(--line);border-radius:10px;
+    font-size:15px;background:#fff;outline:none}
+  input[type=text]:focus{border-color:var(--pink);box-shadow:0 0 0 3px var(--pink-soft)}
+  button{border:0;border-radius:10px;padding:14px 22px;font-size:15px;font-weight:700;cursor:pointer;
+    background:var(--pink);color:#fff;transition:filter .15s}
+  button:hover{filter:brightness(1.05)}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  .ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
+  .mockbanner{margin-top:18px;font-size:13px;color:#8a5a00;background:#fff7e6;border:1px solid #ffe0a3;
+    padding:10px 14px;border-radius:8px;display:none}
+  .panel{margin-top:26px;border:1px solid var(--line);border-radius:12px;background:#fff;overflow:hidden;display:none}
+  .panel h2{margin:0;padding:16px 20px;font-size:15px;border-bottom:1px solid var(--line);background:#fafafa}
+  .meta{padding:16px 20px}
+  .meta div{display:flex;justify-content:space-between;padding:6px 0;font-size:14px;border-bottom:1px dashed var(--line)}
+  .meta div:last-child{border-bottom:0}
+  .meta .k{color:var(--muted)}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;padding:0 20px 18px}
+  .chip{background:var(--pink-soft);color:#b0176a;font-size:13px;font-weight:600;padding:6px 12px;border-radius:20px}
+  .actions{margin-top:22px;display:flex;gap:10px}
+  .err{margin-top:18px;color:#b3261e;background:#fdeceb;border:1px solid #f6c9c5;padding:12px 14px;
+    border-radius:8px;font-size:14px;display:none}
+  .spinner{width:16px;height:16px;border:2px solid rgba(255,255,255,.5);border-top-color:#fff;border-radius:50%;
+    display:inline-block;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:8px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  footer{padding:18px 28px;color:var(--muted);font-size:12px;border-top:1px solid var(--line)}
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">PRA<b>E</b>VA</span>
+  <span class="tag">Search Update Generator</span>
+  <button id="settingsToggle" class="ghost" type="button" style="margin-left:auto;padding:9px 16px;font-size:13px">Settings</button>
+</header>
+
+<main>
+  <div class="card" id="settingsCard" hidden>
+    <h1>Settings</h1>
+    <p class="lead">Store your Ezekia API key here. It's saved on the server and is
+      never sent back to this page — once saved it can't be read or copied out of the app,
+      only replaced or cleared.</p>
+
+    <div class="panel" style="display:block;margin-top:0;margin-bottom:22px">
+      <h2>Ezekia API key</h2>
+      <div class="meta">
+        <div><span class="k">Status</span><span id="cfgStatus">—</span></div>
+        <div><span class="k">Source</span><span id="cfgSource">—</span></div>
+      </div>
+    </div>
+
+    <label for="tokenInput">API key</label>
+    <div class="row">
+      <input id="tokenInput" type="password" placeholder="Paste your Ezekia API key" autocomplete="new-password" spellcheck="false">
+      <button id="saveToken" type="button">Save</button>
+    </div>
+    <p class="lead" style="font-size:13px;margin-top:10px">The field is write-only: after saving it is cleared, and the key is never displayed again.</p>
+
+    <div id="cfgErr" class="err"></div>
+    <div id="cfgMsg" class="mockbanner" style="background:#eafaf0;border-color:#bfe6cf;color:#0f7a5a"></div>
+
+    <div class="actions">
+      <button id="testToken" class="ghost" type="button">Test connection</button>
+      <button id="clearToken" class="ghost" type="button" style="color:#b3261e;border-color:#f0c9c5">Clear key</button>
+    </div>
+  </div>
+
+  <div class="card" id="mainCard">
+    <h1>Generate a Search Update deck</h1>
+    <p class="lead">Paste an Ezekia assignment URL. The app pulls the project and its candidates and
+      auto-fills the Praeva Search Update template — profiles, career histories, and the
+      pipeline / target / discounted tables.</p>
+
+    <label for="url">Ezekia assignment URL</label>
+    <div class="row">
+      <input id="url" type="text" placeholder="https://app.ezekia.com/assignments/12345" autocomplete="off">
+      <button id="previewBtn" class="ghost" type="button">Preview</button>
+    </div>
+
+    <div id="mockbanner" class="mockbanner">
+      Running in <b>demo mode</b> with sample data — set your Ezekia token to fetch live assignments.
+    </div>
+    <div id="err" class="err"></div>
+
+    <div id="panel" class="panel">
+      <h2>What will be generated</h2>
+      <div class="meta" id="meta"></div>
+      <div class="chips" id="chips"></div>
+    </div>
+
+    <div class="actions">
+      <button id="generateBtn" type="button">Generate PowerPoint</button>
+    </div>
+  </div>
+</main>
+
+<footer>Praeva · Fills only candidate-driven slides; executive summary and target landscape are left for manual editing.</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const urlEl = $("#url"), errEl = $("#err"), panel = $("#panel");
+
+function showErr(m){ errEl.textContent = m; errEl.style.display = "block"; }
+function clearErr(){ errEl.style.display = "none"; }
+
+async function preview(){
+  clearErr(); panel.style.display="none";
+  const url = urlEl.value.trim();
+  try{
+    const r = await fetch("/api/preview?url=" + encodeURIComponent(url));
+    const d = await r.json();
+    if(!r.ok){ showErr(d.detail || "Preview failed"); return; }
+    if(d.mock_mode) $("#mockbanner").style.display="block";
+    $("#meta").innerHTML = `
+      <div><span class="k">Assignment</span><span>${d.assignment||"—"}</span></div>
+      <div><span class="k">Title</span><span>${d.title||"—"}</span></div>
+      <div><span class="k">Date</span><span>${d.date||"—"}</span></div>`;
+    const c = d.counts;
+    $("#chips").innerHTML = [
+      ["Engaged (profiles)", c.engaged_profiles],
+      ["Pipeline (table)", c.pipeline_table],
+      ["Discounted (profiles)", c.discounted_profiles],
+      ["Discounted (table)", c.discounted_table],
+      ["Target", "manual"]
+    ].map(([k,v])=>`<span class="chip">${k}: ${v}</span>`).join("");
+    panel.style.display="block";
+  }catch(e){ showErr("Could not reach the server."); }
+}
+
+async function generate(){
+  clearErr();
+  const btn = $("#generateBtn"); const url = urlEl.value.trim();
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Generating…';
+  try{
+    const r = await fetch("/api/generate", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({url})
+    });
+    if(!r.ok){ const d = await r.json().catch(()=>({})); showErr(d.detail||"Generation failed"); return; }
+    const blob = await r.blob();
+    const cd = r.headers.get("Content-Disposition")||"";
+    const m = cd.match(/filename="?([^"]+)"?/);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : "search-update.pptx";
+    document.body.appendChild(a); a.click(); a.remove();
+  }catch(e){ showErr("Could not reach the server."); }
+  finally{ btn.disabled=false; btn.textContent="Generate PowerPoint"; }
+}
+
+$("#previewBtn").onclick = preview;
+$("#generateBtn").onclick = generate;
+urlEl.addEventListener("keydown", e=>{ if(e.key==="Enter") preview(); });
+
+// ---------- settings / config ----------
+const cfgErr = $("#cfgErr"), cfgMsg = $("#cfgMsg");
+function cfgShowErr(m){ cfgErr.textContent=m; cfgErr.style.display="block"; cfgMsg.style.display="none"; }
+function cfgShowMsg(m){ cfgMsg.textContent=m; cfgMsg.style.display="block"; cfgErr.style.display="none"; }
+
+async function refreshConfig(){
+  try{
+    const d = await (await fetch("/api/config")).json();
+    if(d.token_configured){
+      $("#cfgStatus").innerHTML = `Configured &nbsp;<b>${d.token_hint||""}</b>`;
+      $("#cfgSource").textContent = d.token_source === "env" ? "environment variable" : "saved in app";
+    } else {
+      $("#cfgStatus").textContent = "Not configured";
+      $("#cfgSource").textContent = "—";
+    }
+    // demo-mode banner on the main card
+    $("#mockbanner").style.display = d.mock_mode ? "block" : "none";
+  }catch(e){ /* ignore */ }
+}
+
+async function saveToken(){
+  const v = $("#tokenInput").value.trim();
+  if(!v){ cfgShowErr("Enter a key first."); return; }
+  const btn=$("#saveToken"); btn.disabled=true; btn.textContent="Saving…";
+  try{
+    const r = await fetch("/api/config/token", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:v})});
+    const d = await r.json();
+    if(!r.ok){ cfgShowErr(d.detail||"Save failed"); return; }
+    $("#tokenInput").value = "";               // write-only: never keep it in the field
+    cfgShowMsg("Key saved. It's stored on the server and won't be shown again.");
+    refreshConfig();
+  }catch(e){ cfgShowErr("Could not reach the server."); }
+  finally{ btn.disabled=false; btn.textContent="Save"; }
+}
+
+async function testToken(){
+  cfgShowMsg("Testing…");
+  try{
+    const d = await (await fetch("/api/config/test",{method:"POST"})).json();
+    if(d.ok) cfgShowMsg("✓ " + d.detail);
+    else cfgShowErr((d.status?("["+d.status+"] "):"") + d.detail);
+  }catch(e){ cfgShowErr("Could not reach the server."); }
+}
+
+async function clearToken(){
+  const btn=$("#clearToken"); btn.disabled=true;
+  try{
+    await fetch("/api/config/token",{method:"DELETE"});
+    $("#tokenInput").value="";
+    cfgShowMsg("Key cleared — the app is back in demo mode.");
+    refreshConfig();
+  }catch(e){ cfgShowErr("Could not reach the server."); }
+  finally{ btn.disabled=false; }
+}
+
+$("#saveToken").onclick = saveToken;
+$("#testToken").onclick = testToken;
+$("#clearToken").onclick = clearToken;
+$("#tokenInput").addEventListener("keydown", e=>{ if(e.key==="Enter") saveToken(); });
+$("#settingsToggle").onclick = () => {
+  const s = $("#settingsCard");
+  const showing = !s.hidden;
+  s.hidden = showing;
+  $("#mainCard").hidden = !showing;
+  if(!s.hidden) refreshConfig();
+};
+
+refreshConfig();
+</script>
+</body>
+</html>
