@@ -225,11 +225,28 @@ def _client_name(project: Dict[str, Any]) -> str:
     """
     for path in (("company",), ("company", "name"),
                  ("relationships", "company", "data", "name"),
-                 ("meta", "company"), ("label",), ("projectId",), ("title",)):
-        v = _g(project, *path)
+                 ("relationships", "companies", "data", 0, "name"),
+                 ("meta", "company"), ("name",), ("label",), ("projectId",), ("title",)):
+        v = _g_path(project, path)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
+
+
+def _g_path(d: Any, path):
+    """Like _g but supports int indices for lists in the path."""
+    cur = d
+    for k in path:
+        if isinstance(k, int):
+            if isinstance(cur, list) and 0 <= k < len(cur):
+                cur = cur[k]
+            else:
+                return None
+        elif isinstance(cur, dict) and k in cur and cur[k] is not None:
+            cur = cur[k]
+        else:
+            return None
+    return cur
 
 
 def _prepared_for(contacts: List[Dict[str, Any]]) -> List[str]:
@@ -377,6 +394,30 @@ def test_token() -> Dict[str, Any]:
         return {"ok": False, "status": None, "detail": f"Connection error: {e}"}
 
 
+def _key_paths(obj: Any, prefix: str = "", out=None, cap: int = 500):
+    """List nested KEY PATHS of an object (keys only, no values -> no PII)."""
+    if out is None:
+        out = []
+    if len(out) >= cap:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{prefix}.{k}" if prefix else k
+            out.append(p)
+            if isinstance(v, (dict, list)):
+                _key_paths(v, p, out, cap)
+    elif isinstance(obj, list) and obj:
+        _key_paths(obj[0], prefix + "[]", out, cap)
+    return out
+
+
+# candidate-specific include names to probe for where pipeline tags live
+_TAG_FIELD_GUESSES = [
+    "meta.candidateInfo", "meta.candidate", "meta", "candidateInfo",
+    "candidate", "pipelineTags", "pipeline", "statuses", "status", "tags",
+]
+
+
 def diagnose(url: str) -> Dict[str, Any]:
     """Report the STRUCTURE of what Ezekia returns for a URL, to debug empty
     results. Safe: returns statuses, key names, counts and pipeline-tag texts —
@@ -402,10 +443,13 @@ def diagnose(url: str) -> Dict[str, Any]:
         proj_info: Dict[str, Any] = {"http_status": pr.status_code}
         if pr.status_code == 200:
             body = pr.json()
-            proj_info["envelope_keys"] = list(body.keys())
             data = body.get("data", body)
-            proj_info["data_keys"] = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-            proj_info["client_name_detected"] = _client_name(data if isinstance(data, dict) else {})
+            data = data if isinstance(data, dict) else {}
+            proj_info["data_keys"] = list(data.keys())
+            proj_info["name_value"] = data.get("name")
+            proj_info["relationships_keys"] = list(_g(data, "relationships", default={}).keys()) if isinstance(_g(data, "relationships"), dict) else None
+            proj_info["relationship_paths"] = [p for p in _key_paths(_g(data, "relationships", default={})) if "name" in p.lower()][:20]
+            proj_info["client_name_detected"] = _client_name(data)
         else:
             proj_info["body_snippet"] = pr.text[:200]
         out["project"] = proj_info
@@ -448,6 +492,31 @@ def diagnose(url: str) -> Dict[str, Any]:
         else:
             cand_info["body_snippet"] = cr.text[:200]
         out["candidates"] = cand_info
+
+        # --- probe: request extra candidate-include fields, one at a time,
+        #     and report where a tag/status/pipeline-like key then appears ---
+        probe: Dict[str, Any] = {}
+        for guess in _TAG_FIELD_GUESSES:
+            gp = [("fieldsWithCandidate[]", guess), ("count", "3")]
+            try:
+                gr = client.get(f"{BASE_URL}/v4/projects/{assignment_id}/candidates", params=gp)
+            except Exception as e:
+                probe[guess] = {"error": str(e)[:80]}
+                continue
+            entry: Dict[str, Any] = {"status": gr.status_code}
+            if gr.status_code == 200:
+                items = (gr.json() or {}).get("data", [])
+                if items:
+                    paths = _key_paths(items[0])
+                    entry["new_top_keys"] = [p for p in paths if "." not in p and "[]" not in p]
+                    entry["tag_like_paths"] = [
+                        p for p in paths
+                        if any(w in p.lower() for w in ("pipelinetag", "candidateinfo", "status", "tag"))
+                    ][:15]
+                else:
+                    entry["items"] = 0
+            probe[guess] = entry
+        out["tag_field_probe"] = probe
 
     return out
 
