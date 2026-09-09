@@ -369,9 +369,9 @@ def _map_candidate(person: Dict[str, Any]) -> Optional[Candidate]:
 
     cand = Candidate(
         name=person.get("name") or person.get("fullName")
-        or f"{person.get('firstName','')} {person.get('lastName','')}".strip(),
+        or f"{person.get('firstName','') or ''} {person.get('lastName','') or ''}".strip(),
         stage=stage,
-        role=current.get("title", ""),
+        role=current.get("title") or "",
         company=_position_company(current),
         status=status_label,
         has_profile=has_profile,
@@ -390,7 +390,7 @@ def _map_candidate(person: Dict[str, Any]) -> Optional[Candidate]:
 def _position_company(pos: Dict[str, Any]) -> str:
     comp = pos.get("company")
     if isinstance(comp, dict):
-        return comp.get("name", "")
+        return comp.get("name") or ""
     if isinstance(comp, str):
         return comp
     return ""
@@ -406,7 +406,7 @@ def _career(positions: List[Dict[str, Any]]) -> List[CareerEntry]:
         dates = f"{start} - {end}".strip(" -") if (start or end) else ""
         out.append(CareerEntry(
             company=_position_company(p),
-            role=p.get("title", ""),
+            role=p.get("title") or "",
             dates=dates,
         ))
     return out
@@ -415,7 +415,7 @@ def _career(positions: List[Dict[str, Any]]) -> List[CareerEntry]:
 def _education(edu: List[Dict[str, Any]]) -> str:
     lines = []
     for e in edu:
-        school = e.get("school", "")
+        school = e.get("school") or ""
         start = _year(e.get("startDate"))
         end = _year(e.get("endDate"))
         years = f"{start} - {end}".strip(" -") if (start or end) else ""

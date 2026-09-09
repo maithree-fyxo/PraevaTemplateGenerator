@@ -73,6 +73,14 @@ def _first_run(paragraph):
     return paragraph.runs[0] if paragraph.runs else None
 
 
+def _s(v) -> str:
+    """Coerce any value to a safe string. Live Ezekia data returns explicit
+    nulls for absent fields (e.g. {"title": null}), and python-pptx runs an
+    illegal-char regex over run text that raises on None — so every value that
+    reaches a text run passes through here first."""
+    return "" if v is None else str(v)
+
+
 def set_shape_text(shape, text: str):
     """Replace a text shape's content while keeping the first run's formatting.
 
@@ -83,7 +91,7 @@ def set_shape_text(shape, text: str):
     if not shape.has_text_frame:
         return
     tf = shape.text_frame
-    lines = text.split("\n")
+    lines = _s(text).split("\n")
 
     # Capture a style prototype run element to clone for extra paragraphs.
     proto_para = tf.paragraphs[0]
@@ -110,6 +118,7 @@ def set_shape_text(shape, text: str):
 
 def _set_paragraph_text(paragraph, text: str, proto_run_xml=None):
     """Set a paragraph to a single run of `text`, keeping run formatting."""
+    text = _s(text)
     runs = paragraph.runs
     if runs:
         runs[0].text = text
@@ -280,15 +289,16 @@ def _fill_career_row(table, row_idx: int, entry: CareerEntry):
     right = table.cell(row_idx, 1)
 
     # LEFT cell: para0 has run0 (company, bold) + <a:br> + run1 (role)
+    company, role = _s(entry.company), _s(entry.role)
     p0 = left.text_frame.paragraphs[0]
     runs = p0.runs
     if len(runs) >= 2:
-        runs[0].text = entry.company
-        runs[1].text = entry.role
+        runs[0].text = company
+        runs[1].text = role
         for r in runs[2:]:
             r._r.getparent().remove(r._r)
     elif len(runs) == 1:
-        runs[0].text = entry.company if not entry.role else f"{entry.company}  {entry.role}"
+        runs[0].text = company if not role else f"{company}  {role}"
     # blank any extra paragraphs in the left cell
     for extra in left.text_frame.paragraphs[1:]:
         for r in extra.runs:
@@ -299,6 +309,7 @@ def _fill_career_row(table, row_idx: int, entry: CareerEntry):
 
 
 def _set_dates_cell(cell, dates: str):
+    dates = _s(dates)
     target_para = None
     for para in cell.text_frame.paragraphs:
         if para.runs:
