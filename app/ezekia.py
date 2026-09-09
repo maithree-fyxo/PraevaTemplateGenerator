@@ -75,20 +75,21 @@ PROFILE_INCLUDES = [
 # `fields=meta.candidate` parameter (confirmed against Ezekia support docs).
 TAG_FIELDS_PARAM = ("fields", "meta.candidate")
 
-# CONFIRMED via diagnose probe: the /v4 candidates endpoint returns ONLY
-# profile.positions and IGNORES fieldsWithCandidate[] for every other block
-# (currentStatus/confidential/education/aspirations all came back 0/93).
-# Those blocks — like the pipeline tags — are only returned by the non-versioned
-# endpoint via `fields=`. We fetch them there and merge by candidate id.
-NONV4_FIELDS = [
-    "meta.candidate",
-    "profile.positions",
-    "profile.currentStatus",   # location
-    "profile.confidential",    # salary, notice
+# CONFIRMED via diagnose probe: the /v4 candidates LIST endpoint returns ONLY
+# profile.positions and ignores every other field spelling for the other blocks.
+# The v4 PERSON DETAIL endpoint DOES return them — but only ONE block per request
+# (confirmed with Maithree): grouping several `fields` collapses to just one. So
+# we fetch each block as its own call:
+#   GET /v4/people/{id}?fields=profile.confidential    (salary, notice)
+#   GET /v4/people/{id}?fields=profile.currentStatus   (location)
+#   GET /v4/people/{id}?fields=profile.education
+# This is only needed for FULL-PROFILE candidates (Engaged + Praeva-Discounted);
+# table rows use role/company from the positions already in the list response.
+PERSON_PROFILE_FIELDS = [
+    "profile.confidential",
+    "profile.currentStatus",
     "profile.education",
-    "profile.aspirations",
 ]
-NONV4_FIELDS_PARAM = ("fields", ",".join(NONV4_FIELDS))
 
 # Back-compat alias (diagnose + any external refs).
 CANDIDATE_INCLUDES = PROFILE_INCLUDES
@@ -183,27 +184,29 @@ class EzekiaClient:
     def fetch_raw(self, assignment_id: str) -> Dict[str, Any]:
         profile_params = [("fieldsWithCandidate[]", f) for f in PROFILE_INCLUDES]
         profile_params.append(("count", "500"))
-        # The non-v4 endpoint returns everything the v4 endpoint omits
-        # (currentStatus/confidential/education/aspirations) PLUS meta.candidate.
-        block_params = [NONV4_FIELDS_PARAM, ("count", "500")]
+        tag_params = [TAG_FIELDS_PARAM, ("count", "500")]
         with httpx.Client(timeout=self.timeout, headers=self._headers()) as client:
             project = self._get(client, f"/v4/projects/{assignment_id}").get("data", {})
 
-            # 1) base records from the v4 endpoint (positions + addresses)
+            # 1) base records from the v4 list endpoint (positions + addresses + id)
             candidates = self._get(
                 client, f"/v4/projects/{assignment_id}/candidates", params=profile_params
             ).get("data", []) or []
 
-            # 2) tags + the omitted profile blocks from the documented non-v4
-            #    endpoint, merged into the base records by id
-            extra = []
+            # 2) pipeline tags from the documented non-v4 endpoint, merged by id
+            tagged = []
             try:
-                extra = self._get(
-                    client, f"/projects/{assignment_id}/candidates", params=block_params
+                tagged = self._get(
+                    client, f"/projects/{assignment_id}/candidates", params=tag_params
                 ).get("data", []) or []
             except EzekiaError:
-                extra = []
-            candidates = _merge_records(candidates, extra)
+                tagged = []
+            candidates = _merge_meta(candidates, tagged)
+
+            # 3) enrich ONLY the full-profile candidates with the blocks the list
+            #    endpoint omits (location/salary/notice/education), via per-person
+            #    detail calls (one field per call, run concurrently).
+            _enrich_profile_candidates(client, self.base_url, candidates)
 
             try:
                 contacts = self._get(client, f"/v4/projects/{assignment_id}/contacts").get("data", [])
@@ -256,38 +259,73 @@ def _merge_meta(profiles: List[Dict[str, Any]], tagged: List[Dict[str, Any]]) ->
     return profiles
 
 
-def _merge_records(base: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merge the non-v4 `extra` records (meta.candidate + the profile blocks the
-    v4 endpoint omits) into the rich v4 `base` records, keyed by candidate id.
-    Fills gaps only — never overwrites data the base already has."""
-    if not base:
-        return extra
-    ex_by_id = {r.get("id"): r for r in extra
-                if isinstance(r, dict) and r.get("id") is not None}
-    for c in base:
+def _merge_profile_block(candidate: Dict[str, Any], block: Dict[str, Any]) -> None:
+    """Gap-fill a candidate's profile with sub-blocks from a person-detail call."""
+    if not block:
+        return
+    prof = candidate.get("profile")
+    if not isinstance(prof, dict):
+        prof = {}
+        candidate["profile"] = prof
+    for k, v in block.items():
+        if v not in (None, "", [], {}) and prof.get(k) in (None, "", [], {}):
+            prof[k] = v
+
+
+def _person_id(candidate: Dict[str, Any]):
+    for key in ("id", "personId", "person_id"):
+        v = candidate.get(key)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _enrich_profile_candidates(client, base_url: str, candidates: List[Dict[str, Any]],
+                               limit: Optional[int] = None) -> Dict[str, Any]:
+    """For each FULL-PROFILE candidate, fetch profile.confidential /
+    currentStatus / education from the v4 person endpoint (one field per call,
+    concurrently) and merge into the record. Returns a small summary for
+    diagnostics. Best-effort: failures leave the field blank, never raise."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    targets = []
+    for c in candidates:
         if not isinstance(c, dict):
             continue
-        e = ex_by_id.get(c.get("id"))
-        if not e:
-            continue
-        # meta (pipeline tags)
-        if isinstance(e.get("meta"), dict) and e["meta"]:
-            existing = c.get("meta")
-            c["meta"] = {**e["meta"], **existing} if isinstance(existing, dict) else e["meta"]
-        # profile sub-blocks (currentStatus/confidential/education/aspirations/positions)
-        eprof = e.get("profile")
-        if isinstance(eprof, dict):
-            cprof = c.get("profile")
-            if not isinstance(cprof, dict):
-                cprof = {}
-                c["profile"] = cprof
-            for k, v in eprof.items():
-                if v not in (None, "", [], {}) and cprof.get(k) in (None, "", [], {}):
-                    cprof[k] = v
-        # top-level addresses
-        if not c.get("addresses") and e.get("addresses"):
-            c["addresses"] = e["addresses"]
-    return base
+        route = _candidate_route(c)
+        if route is not None and route[2] and _person_id(c) is not None:
+            targets.append(c)
+    if limit is not None:
+        targets = targets[:limit]
+
+    summary = {"profile_candidates": len(targets), "calls": 0, "errors": 0}
+    if not targets:
+        return summary
+
+    by_id = {_person_id(c): c for c in targets}
+
+    def fetch(pid, field):
+        try:
+            r = client.get(f"{base_url}/v4/people/{pid}", params=[("fields", field)])
+            if r.status_code == 200:
+                return pid, ((r.json() or {}).get("data", {}) or {}).get("profile") or {}
+            return pid, None
+        except Exception:
+            return pid, None
+
+    tasks = [(pid, field) for pid in by_id for field in PERSON_PROFILE_FIELDS]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(fetch, pid, field) for pid, field in tasks]
+        for fut in as_completed(futures):
+            summary["calls"] += 1
+            pid, block = fut.result()
+            if block is None:
+                summary["errors"] += 1
+                continue
+            cand = by_id.get(pid)
+            if cand is not None:
+                _merge_profile_block(cand, block)
+    return summary
 
 
 def _g(d: Any, *keys, default=None):
@@ -678,68 +716,6 @@ def _profile_field_probe(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _blocks_present(items: List[Dict[str, Any]]) -> Dict[str, int]:
-    """Count, across records, how many have each profile block / field non-empty."""
-    keys = ("positions", "currentStatus", "confidential", "education", "aspirations")
-    out = {k: 0 for k in keys}
-    out["addresses"] = 0
-    out["meta"] = 0
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        prof = it.get("profile") or {}
-        for k in keys:
-            if prof.get(k) not in (None, "", [], {}):
-                out[k] += 1
-        if it.get("addresses") not in (None, "", [], {}):
-            out["addresses"] += 1
-        if it.get("meta") not in (None, "", [], {}):
-            out["meta"] += 1
-    return out
-
-
-def _fields_spec_probe(client, base_url: str, assignment_id: str) -> Dict[str, Any]:
-    """Try many `fields` spellings against the NON-v4 candidates endpoint and
-    report which one actually returns currentStatus / confidential / education.
-    Counts only — no personal values."""
-    path = f"{base_url}/projects/{assignment_id}/candidates"
-    # (label, param_list)
-    trials = [
-        ("meta.candidate [control]",        [("fields", "meta.candidate")]),
-        ("profile.currentStatus",           [("fields", "profile.currentStatus")]),
-        ("profile.confidential",            [("fields", "profile.confidential")]),
-        ("profile.education",               [("fields", "profile.education")]),
-        ("profile.aspirations",             [("fields", "profile.aspirations")]),
-        ("currentStatus (no profile.)",     [("fields", "currentStatus")]),
-        ("confidential (no profile.)",      [("fields", "confidential")]),
-        ("profile",                         [("fields", "profile")]),
-        ("location",                        [("fields", "location")]),
-        ("profile.location",                [("fields", "profile.location")]),
-        ("comma combo",                     [("fields", "meta.candidate,profile.currentStatus,profile.confidential")]),
-        ("repeated fields",                 [("fields", "profile.currentStatus"), ("fields", "profile.confidential")]),
-        ("fields[] bracket",                [("fields[]", "profile.currentStatus"), ("fields[]", "profile.confidential")]),
-    ]
-    report: Dict[str, Any] = {}
-    for label, base in trials:
-        params = list(base) + [("count", "5")]
-        try:
-            r = client.get(path, params=params)
-        except Exception as e:  # pragma: no cover
-            report[label] = {"error": str(e)[:80]}
-            continue
-        entry: Dict[str, Any] = {"status": r.status_code}
-        if r.status_code == 200:
-            items = (r.json() or {}).get("data", []) or []
-            entry["n"] = len(items)
-            present = _blocks_present(items)
-            # only surface blocks that actually appeared (keep it readable)
-            entry["nonempty"] = {k: v for k, v in present.items() if v}
-        else:
-            entry["body"] = r.text[:100]
-        report[label] = entry
-    return report
-
-
 def diagnose(url: str) -> Dict[str, Any]:
     """Report the STRUCTURE of what Ezekia returns for a URL, to debug empty
     results. Safe: returns statuses, key names, counts and pipeline-tag texts —
@@ -826,24 +802,10 @@ def diagnose(url: str) -> Dict[str, Any]:
             cand_info["envelope_keys"] = list(body.keys()) if isinstance(body, dict) else type(body).__name__
             data = body.get("data", body) if isinstance(body, dict) else body
             items = data if isinstance(data, list) else []
-            # fetch the omitted profile blocks + tags from the non-v4 endpoint and
-            # merge, exactly like production
-            blocks_info: Dict[str, Any] = {
-                "endpoint": f"/projects/{assignment_id}/candidates?fields={NONV4_FIELDS_PARAM[1]}"
-            }
-            try:
-                br = client.get(f"{BASE_URL}/projects/{assignment_id}/candidates",
-                                params=[NONV4_FIELDS_PARAM, ("count", "500")])
-                blocks_info["http_status"] = br.status_code
-                if br.status_code == 200:
-                    bitems = (br.json() or {}).get("data", []) or []
-                    blocks_info["raw_count"] = len(bitems)
-                    items = _merge_records(items, bitems)
-                else:
-                    blocks_info["body_snippet"] = br.text[:200]
-            except Exception as e:  # pragma: no cover
-                blocks_info["error"] = str(e)[:120]
-            out["blocks_fetch"] = blocks_info
+            # merge pipeline tags, then enrich a SAMPLE of profile candidates via
+            # the v4 person endpoint (one field per call), exactly like production
+            items = _merge_meta(items, [{"id": k, "meta": v} for k, v in meta_by_id.items()])
+            out["person_enrich"] = _enrich_profile_candidates(client, BASE_URL, items, limit=5)
             cand_info["raw_count"] = len(items)
             cand_info["merged_with_tags"] = len(meta_by_id)
             # where do pipeline tags live? sample first item's key paths
@@ -874,10 +836,9 @@ def diagnose(url: str) -> Dict[str, Any]:
                     elif stage == Stage.DISCOUNTED: routed["discounted_table"] += 1
             cand_info["pipeline_tags_seen"] = tag_census
             cand_info["routed_counts"] = routed
-            # where do location / salary / notice actually live?
+            # confirm the enriched blocks now populate (only the sampled profile
+            # candidates carry currentStatus/confidential after enrichment)
             out["profile_field_probe"] = _profile_field_probe(items)
-            # which `fields` spelling actually returns the missing blocks?
-            out["fields_spec_probe"] = _fields_spec_probe(client, BASE_URL, assignment_id)
         else:
             cand_info["body_snippet"] = cr.text[:200]
         out["candidates"] = cand_info
