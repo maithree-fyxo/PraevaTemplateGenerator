@@ -376,7 +376,7 @@ def _map_candidate(person: Dict[str, Any]) -> Optional[Candidate]:
         status=status_label,
         has_profile=has_profile,
         salary=_salary(profile),
-        location=_location(profile),
+        location=_location(person, profile),
         availability=_availability(profile),
         education=_education(profile.get("education", [])),
         career=_career(positions),
@@ -401,8 +401,11 @@ def _career(positions: List[Dict[str, Any]]) -> List[CareerEntry]:
     for p in positions:
         start = _year(p.get("startDate"))
         end = _year(p.get("endDate"))
-        if not end and (p.get("tense") or p.get("primary")):
-            end = "present"
+        # Ezekia encodes an open-ended (current) role as year 9999 -> show "P".
+        if end == "9999":
+            end = "P"
+        elif not end and (p.get("tense") or p.get("primary")):
+            end = "P"
         dates = f"{start} - {end}".strip(" -") if (start or end) else ""
         out.append(CareerEntry(
             company=_position_company(p),
@@ -439,21 +442,63 @@ def _salary(profile: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-def _location(profile: Dict[str, Any]) -> str:
-    # v4 currentStatus (api.v3.person.currentStatus) exposes a `locations` array.
-    cur_locs = _g(profile, "currentStatus", "locations", default=[]) or []
-    if cur_locs and isinstance(cur_locs[0], dict):
-        nm = cur_locs[0].get("name")
-        if nm:
-            return nm
-    # older singular shape, just in case
-    loc = _g(profile, "currentStatus", "location", "name")
-    if loc:
-        return loc
-    asp_locs = _g(profile, "aspirations", "locations", default=[]) or []
-    if asp_locs and isinstance(asp_locs[0], dict):
-        return asp_locs[0].get("name", "")
+def _loc_str(d: Any) -> str:
+    """Render a location value (string or dict) to a display string.
+    Handles both a named location ({name:...}) and a structured address
+    ({city, region, country, ...}) -> "City, Country"."""
+    if isinstance(d, str):
+        return d.strip()
+    if isinstance(d, dict):
+        for key in ("name", "formatted", "label", "displayName", "fullName"):
+            v = d.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # compose from structured parts
+        parts = [d.get("city") or d.get("town"),
+                 d.get("region") or d.get("state") or d.get("county"),
+                 d.get("country") or d.get("countryName")]
+        parts = [str(p).strip() for p in parts if p and str(p).strip()]
+        # de-dupe while preserving order (e.g. city == region)
+        seen, uniq = set(), []
+        for p in parts:
+            if p.lower() not in seen:
+                seen.add(p.lower()); uniq.append(p)
+        return ", ".join(uniq)
     return ""
+
+
+def _first_loc(seq: Any) -> str:
+    if isinstance(seq, list):
+        for item in seq:
+            s = _loc_str(item)
+            if s:
+                return s
+    return ""
+
+
+def _location(person: Dict[str, Any], profile: Dict[str, Any]) -> str:
+    """Current location, tried across the shapes Ezekia uses. Order favours
+    the person's CURRENT location over aspirational (desired) locations."""
+    # 1) currentStatus.locations[] (array) or singular currentStatus.location
+    s = _first_loc(_g(profile, "currentStatus", "locations", default=[]))
+    if s:
+        return s
+    s = _loc_str(_g(profile, "currentStatus", "location", default=None))
+    if s:
+        return s
+    # 2) person-level addresses[] (top-level on the candidate record)
+    s = _first_loc(person.get("addresses"))
+    if s:
+        return s
+    # 3) location on the current (first) position
+    positions = _g(profile, "positions", default=[]) or []
+    if positions and isinstance(positions[0], dict):
+        s = _loc_str(positions[0].get("location"))
+        if s:
+            return s
+    # 4) aspirational locations (where they WANT to be) — last resort
+    s = _first_loc(_g(profile, "aspirations", "locations", default=[]))
+    return s
 
 
 def _availability(profile: Dict[str, Any]) -> str:
@@ -515,6 +560,70 @@ _TAG_FIELD_GUESSES = [
     "meta.candidateInfo", "meta.candidate", "meta", "candidateInfo",
     "candidate", "pipelineTags", "pipeline", "statuses", "status", "tags",
 ]
+
+
+def _leaf_paths(obj: Any, prefix: str = "", out=None, cap: int = 4000):
+    """Yield (path, value) for every scalar leaf, collapsing list indices to []."""
+    if out is None:
+        out = []
+    if len(out) >= cap:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, (dict, list)):
+                _leaf_paths(v, p, out, cap)
+            else:
+                out.append((p, v))
+    elif isinstance(obj, list):
+        for item in obj:
+            p = f"{prefix}[]"
+            if isinstance(item, (dict, list)):
+                _leaf_paths(item, p, out, cap)
+            else:
+                out.append((p, item))
+    return out
+
+
+def _profile_field_probe(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Find where location / salary / notice actually live. Reports, per
+    candidate-record leaf path matching those keywords, how many records HAVE
+    the path and how many have a NON-EMPTY value. Values themselves are not
+    returned — only paths and counts — so no personal data leaves the server."""
+    KW = ("location", "city", "town", "country", "region", "state", "address",
+          "salary", "compensation", "remuneration", "package", "bonus",
+          "notice", "availab")
+    present: Dict[str, int] = {}
+    nonempty: Dict[str, int] = {}
+    profile_key_presence = {k: 0 for k in
+                            ("positions", "currentStatus", "confidential",
+                             "aspirations", "education")}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        prof = it.get("profile") or {}
+        for k in profile_key_presence:
+            v = prof.get(k)
+            if v not in (None, "", [], {}):
+                profile_key_presence[k] += 1
+        # walk the whole record (profile + top-level addresses etc.)
+        for path, val in _leaf_paths({"profile": prof,
+                                      "addresses": it.get("addresses")}):
+            low = path.lower()
+            if any(k in low for k in KW):
+                present[path] = present.get(path, 0) + 1
+                if val not in (None, "", [], {}):
+                    nonempty[path] = nonempty.get(path, 0) + 1
+    # keep only paths that are non-empty for at least one candidate, sorted by fill
+    filled = sorted(((p, nonempty.get(p, 0), present.get(p, 0))
+                     for p in present if nonempty.get(p, 0) > 0),
+                    key=lambda x: (-x[1], x[0]))
+    return {
+        "profile_blocks_nonempty": profile_key_presence,
+        "location_salary_notice_paths": [
+            {"path": p, "nonempty": ne, "present": pr} for p, ne, pr in filled
+        ][:40],
+    }
 
 
 def diagnose(url: str) -> Dict[str, Any]:
@@ -635,6 +744,8 @@ def diagnose(url: str) -> Dict[str, Any]:
                     elif stage == Stage.DISCOUNTED: routed["discounted_table"] += 1
             cand_info["pipeline_tags_seen"] = tag_census
             cand_info["routed_counts"] = routed
+            # where do location / salary / notice actually live?
+            out["profile_field_probe"] = _profile_field_probe(items)
         else:
             cand_info["body_snippet"] = cr.text[:200]
         out["candidates"] = cand_info
