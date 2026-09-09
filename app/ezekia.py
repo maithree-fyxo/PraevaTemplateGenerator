@@ -17,8 +17,14 @@ Key endpoints
        &fieldsWithCandidate[]=profile.confidential
        &fieldsWithCandidate[]=profile.currentStatus
        &fieldsWithCandidate[]=profile.aspirations
-       &fieldsWithCandidate[]=meta.candidate
-     -> each person embeds profile.* AND meta.candidate.pipelineTags
+     -> each person embeds profile.* (career, education, salary, location)
+  GET /projects/{id}/candidates?fields=meta.candidate   (NON-v4)
+     -> each person embeds meta.candidate.pipelineTags (the routing tags).
+        Per Ezekia support, pipeline/status tags are ONLY returned by the
+        non-versioned endpoint with the singular `fields=meta.candidate`
+        parameter — the v4 endpoint + fieldsWithCandidate[] does NOT return
+        them. We therefore fetch tags from this endpoint and merge them into
+        the rich v4 profile records by candidate id.
   GET /v4/projects/{id}/contacts             -> { data: [person] }  (Prepared for)
 
 Auth: Bearer token (set EZEKIA_TOKEN). Demo mode (mock data) is used when no
@@ -55,17 +61,22 @@ def use_mock() -> bool:
     """Demo mode: forced by env, or whenever no token is configured."""
     return config.use_mock()
 
-# Fields to embed on the candidates call (one round-trip for the whole deck).
-# `meta.candidate` is the candidate-specific include (api.v4.person.candidate enum)
-# that makes Ezekia return meta.candidate.pipelineTags — the pipeline routing tags.
-CANDIDATE_INCLUDES = [
-    "meta.candidate",
+# Profile fields to embed on the v4 candidates call (career, education, salary,
+# location). The v4 endpoint returns these richly via fieldsWithCandidate[].
+PROFILE_INCLUDES = [
     "profile.positions",
     "profile.education",
     "profile.confidential",
     "profile.currentStatus",
     "profile.aspirations",
 ]
+
+# Pipeline/status tags come from the NON-versioned endpoint with the singular
+# `fields=meta.candidate` parameter (confirmed against Ezekia support docs).
+TAG_FIELDS_PARAM = ("fields", "meta.candidate")
+
+# Back-compat alias (diagnose + any external refs).
+CANDIDATE_INCLUDES = PROFILE_INCLUDES
 
 # How each Ezekia pipeline tag (lower-cased) routes into the report.
 # Value = (Stage, has_profile):
@@ -135,13 +146,27 @@ class EzekiaClient:
         return {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
 
     def fetch_raw(self, assignment_id: str) -> Dict[str, Any]:
-        params = [("fieldsWithCandidate[]", f) for f in CANDIDATE_INCLUDES]
-        params.append(("count", "500"))
+        profile_params = [("fieldsWithCandidate[]", f) for f in PROFILE_INCLUDES]
+        profile_params.append(("count", "500"))
+        tag_params = [TAG_FIELDS_PARAM, ("count", "500")]
         with httpx.Client(timeout=self.timeout, headers=self._headers()) as client:
             project = self._get(client, f"/v4/projects/{assignment_id}").get("data", {})
+
+            # 1) rich profile records from the v4 endpoint
             candidates = self._get(
-                client, f"/v4/projects/{assignment_id}/candidates", params=params
-            ).get("data", [])
+                client, f"/v4/projects/{assignment_id}/candidates", params=profile_params
+            ).get("data", []) or []
+
+            # 2) pipeline tags from the documented non-v4 endpoint, merged by id
+            tagged = []
+            try:
+                tagged = self._get(
+                    client, f"/projects/{assignment_id}/candidates", params=tag_params
+                ).get("data", []) or []
+            except EzekiaError:
+                tagged = []
+            candidates = _merge_meta(candidates, tagged)
+
             try:
                 contacts = self._get(client, f"/v4/projects/{assignment_id}/contacts").get("data", [])
             except EzekiaError:
@@ -167,6 +192,32 @@ class EzekiaClient:
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
+def _merge_meta(profiles: List[Dict[str, Any]], tagged: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge `meta` (pipeline tags) from the non-v4 tag call into the rich v4
+    profile records, keyed by candidate id. If the profile call came back empty
+    for some reason, fall back to the tagged records so routing can still run."""
+    if not profiles:
+        return tagged
+    meta_by_id: Dict[Any, Dict[str, Any]] = {}
+    for t in tagged:
+        if not isinstance(t, dict):
+            continue
+        tid = t.get("id")
+        meta = t.get("meta")
+        if tid is not None and isinstance(meta, dict) and meta:
+            meta_by_id[tid] = meta
+    for c in profiles:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id")
+        incoming = meta_by_id.get(cid)
+        if incoming:
+            existing = c.get("meta")
+            # keep anything already present; layer the tag meta underneath
+            c["meta"] = {**incoming, **existing} if isinstance(existing, dict) else incoming
+    return profiles
+
+
 def _g(d: Any, *keys, default=None):
     """Safe nested get: _g(obj, 'a', 'b') -> obj['a']['b'] or default."""
     cur = d
@@ -452,7 +503,7 @@ def diagnose(url: str) -> Dict[str, Any]:
 
     token = config.get_ezekia_token()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    params = [("fieldsWithCandidate[]", f) for f in CANDIDATE_INCLUDES] + [("count", "500")]
+    params = [("fieldsWithCandidate[]", f) for f in PROFILE_INCLUDES] + [("count", "500")]
 
     with httpx.Client(timeout=45.0, headers=headers) as client:
         # --- project ---
@@ -471,7 +522,49 @@ def diagnose(url: str) -> Dict[str, Any]:
             proj_info["body_snippet"] = pr.text[:200]
         out["project"] = proj_info
 
-        # --- candidates ---
+        # --- pipeline tags via the DOCUMENTED non-v4 endpoint --------------- #
+        # Ezekia support: GET /projects/{id}/candidates?fields=meta.candidate
+        # This is the ONLY endpoint/param combination that returns pipeline tags.
+        tag_check: Dict[str, Any] = {}
+        meta_by_id: Dict[Any, Dict[str, Any]] = {}
+        try:
+            tr = client.get(
+                f"{BASE_URL}/projects/{assignment_id}/candidates",
+                params=[TAG_FIELDS_PARAM, ("count", "500")],
+            )
+            tag_check["endpoint"] = f"/projects/{assignment_id}/candidates?fields=meta.candidate"
+            tag_check["http_status"] = tr.status_code
+            if tr.status_code == 200:
+                titems = (tr.json() or {}).get("data", []) or []
+                tag_check["raw_count"] = len(titems)
+                tag_check["any_meta"] = any(isinstance(t, dict) and t.get("meta") for t in titems)
+                tcensus: Dict[str, int] = {}
+                for t in titems:
+                    tid = t.get("id") if isinstance(t, dict) else None
+                    m = t.get("meta") if isinstance(t, dict) else None
+                    if tid is not None and isinstance(m, dict) and m:
+                        meta_by_id[tid] = m
+                    tags = (_g(t, "meta", "candidate", "pipelineTags")
+                            or _g(t, "meta", "candidateInfo", "pipelineTags") or [])
+                    for tag in tags:
+                        if isinstance(tag, dict) and tag.get("text"):
+                            tcensus[tag["text"]] = tcensus.get(tag["text"], 0) + 1
+                tag_check["pipeline_tags_seen"] = tcensus
+                # show where meta sits on the first tagged record
+                for t in titems:
+                    if isinstance(t, dict) and isinstance(t.get("meta"), dict) and t["meta"]:
+                        tag_check["sample_meta_keys"] = list(t["meta"].keys())
+                        cand_meta = _g(t, "meta", "candidate")
+                        if isinstance(cand_meta, dict):
+                            tag_check["sample_candidate_keys"] = list(cand_meta.keys())
+                        break
+            else:
+                tag_check["body_snippet"] = tr.text[:200]
+        except Exception as e:  # pragma: no cover
+            tag_check["error"] = str(e)[:120]
+        out["tag_endpoint_check"] = tag_check
+
+        # --- candidates (rich v4 profiles, merged with tags) --------------- #
         cr = client.get(f"{BASE_URL}/v4/projects/{assignment_id}/candidates", params=params)
         cand_info: Dict[str, Any] = {"http_status": cr.status_code, "params_sent": [p[0]+"="+p[1] for p in params]}
         if cr.status_code == 200:
@@ -479,7 +572,10 @@ def diagnose(url: str) -> Dict[str, Any]:
             cand_info["envelope_keys"] = list(body.keys()) if isinstance(body, dict) else type(body).__name__
             data = body.get("data", body) if isinstance(body, dict) else body
             items = data if isinstance(data, list) else []
+            # merge in the pipeline meta fetched above, exactly like production
+            items = _merge_meta(items, [{"id": k, "meta": v} for k, v in meta_by_id.items()])
             cand_info["raw_count"] = len(items)
+            cand_info["merged_with_tags"] = len(meta_by_id)
             # where do pipeline tags live? sample first item's key paths
             if items:
                 first = items[0]
@@ -511,60 +607,6 @@ def diagnose(url: str) -> Dict[str, Any]:
         else:
             cand_info["body_snippet"] = cr.text[:200]
         out["candidates"] = cand_info
-
-        # --- probe: request extra candidate-include fields, one at a time,
-        #     and report where a tag/status/pipeline-like key then appears ---
-        probe: Dict[str, Any] = {}
-        for guess in _TAG_FIELD_GUESSES:
-            gp = [("fieldsWithCandidate[]", guess), ("count", "3")]
-            try:
-                gr = client.get(f"{BASE_URL}/v4/projects/{assignment_id}/candidates", params=gp)
-            except Exception as e:
-                probe[guess] = {"error": str(e)[:80]}
-                continue
-            entry: Dict[str, Any] = {"status": gr.status_code}
-            if gr.status_code == 200:
-                items = (gr.json() or {}).get("data", [])
-                if items:
-                    paths = _key_paths(items[0])
-                    entry["new_top_keys"] = [p for p in paths if "." not in p and "[]" not in p]
-                    entry["tag_like_paths"] = [
-                        p for p in paths
-                        if any(w in p.lower() for w in ("pipelinetag", "candidateinfo", "status", "tag"))
-                    ][:15]
-                else:
-                    entry["items"] = 0
-            probe[guess] = entry
-        out["tag_field_probe"] = probe
-
-        # --- full nested key paths of the first candidate (keys only) ---
-        try:
-            cr2 = client.get(f"{BASE_URL}/v4/projects/{assignment_id}/candidates",
-                             params=[("fieldsWithCandidate[]", f) for f in CANDIDATE_INCLUDES] + [("count", "1")])
-            items = (cr2.json() or {}).get("data", [])
-            if items:
-                out["first_candidate_all_keypaths"] = _key_paths(items[0], cap=300)
-        except Exception as e:
-            out["first_candidate_all_keypaths"] = f"error: {e}"
-
-        # --- pull the OpenAPI spec to find the real candidate include names ---
-        try:
-            sp = client.get("https://ezekia.com/docs?api-docs.json")
-            if sp.status_code == 200:
-                schemas = (sp.json().get("components") or {}).get("schemas", {})
-                import json as _json
-                spec_out = {}
-                for key in ("api.v4.person.candidate", "api.v4.person.meta",
-                            "api.v4.person.meta.candidate", "api.v4.person.meta.candidateInfo",
-                            "api.v4.person.fieldWithCandidate", "api.v4.person.field"):
-                    node = schemas.get(key)
-                    if node is not None:
-                        spec_out[key] = _json.dumps(node)[:1200]
-                out["spec_schemas"] = spec_out
-            else:
-                out["spec_schemas"] = {"http_status": sp.status_code}
-        except Exception as e:
-            out["spec_schemas"] = {"error": str(e)[:120]}
 
     return out
 
