@@ -678,6 +678,68 @@ def _profile_field_probe(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _blocks_present(items: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Count, across records, how many have each profile block / field non-empty."""
+    keys = ("positions", "currentStatus", "confidential", "education", "aspirations")
+    out = {k: 0 for k in keys}
+    out["addresses"] = 0
+    out["meta"] = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        prof = it.get("profile") or {}
+        for k in keys:
+            if prof.get(k) not in (None, "", [], {}):
+                out[k] += 1
+        if it.get("addresses") not in (None, "", [], {}):
+            out["addresses"] += 1
+        if it.get("meta") not in (None, "", [], {}):
+            out["meta"] += 1
+    return out
+
+
+def _fields_spec_probe(client, base_url: str, assignment_id: str) -> Dict[str, Any]:
+    """Try many `fields` spellings against the NON-v4 candidates endpoint and
+    report which one actually returns currentStatus / confidential / education.
+    Counts only — no personal values."""
+    path = f"{base_url}/projects/{assignment_id}/candidates"
+    # (label, param_list)
+    trials = [
+        ("meta.candidate [control]",        [("fields", "meta.candidate")]),
+        ("profile.currentStatus",           [("fields", "profile.currentStatus")]),
+        ("profile.confidential",            [("fields", "profile.confidential")]),
+        ("profile.education",               [("fields", "profile.education")]),
+        ("profile.aspirations",             [("fields", "profile.aspirations")]),
+        ("currentStatus (no profile.)",     [("fields", "currentStatus")]),
+        ("confidential (no profile.)",      [("fields", "confidential")]),
+        ("profile",                         [("fields", "profile")]),
+        ("location",                        [("fields", "location")]),
+        ("profile.location",                [("fields", "profile.location")]),
+        ("comma combo",                     [("fields", "meta.candidate,profile.currentStatus,profile.confidential")]),
+        ("repeated fields",                 [("fields", "profile.currentStatus"), ("fields", "profile.confidential")]),
+        ("fields[] bracket",                [("fields[]", "profile.currentStatus"), ("fields[]", "profile.confidential")]),
+    ]
+    report: Dict[str, Any] = {}
+    for label, base in trials:
+        params = list(base) + [("count", "5")]
+        try:
+            r = client.get(path, params=params)
+        except Exception as e:  # pragma: no cover
+            report[label] = {"error": str(e)[:80]}
+            continue
+        entry: Dict[str, Any] = {"status": r.status_code}
+        if r.status_code == 200:
+            items = (r.json() or {}).get("data", []) or []
+            entry["n"] = len(items)
+            present = _blocks_present(items)
+            # only surface blocks that actually appeared (keep it readable)
+            entry["nonempty"] = {k: v for k, v in present.items() if v}
+        else:
+            entry["body"] = r.text[:100]
+        report[label] = entry
+    return report
+
+
 def diagnose(url: str) -> Dict[str, Any]:
     """Report the STRUCTURE of what Ezekia returns for a URL, to debug empty
     results. Safe: returns statuses, key names, counts and pipeline-tag texts —
@@ -814,6 +876,8 @@ def diagnose(url: str) -> Dict[str, Any]:
             cand_info["routed_counts"] = routed
             # where do location / salary / notice actually live?
             out["profile_field_probe"] = _profile_field_probe(items)
+            # which `fields` spelling actually returns the missing blocks?
+            out["fields_spec_probe"] = _fields_spec_probe(client, BASE_URL, assignment_id)
         else:
             cand_info["body_snippet"] = cr.text[:200]
         out["candidates"] = cand_info
