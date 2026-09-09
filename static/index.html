@@ -112,7 +112,10 @@
 
     <div class="actions">
       <button id="generateBtn" type="button">Generate PowerPoint</button>
+      <button id="diagnoseBtn" class="ghost" type="button">Diagnose</button>
     </div>
+
+    <pre id="diagOut" style="display:none;margin-top:18px;background:#0f1115;color:#d7e0ea;padding:14px 16px;border-radius:10px;font-size:12px;line-height:1.5;overflow:auto;max-height:340px;white-space:pre-wrap"></pre>
   </div>
 </main>
 
@@ -170,8 +173,19 @@ async function generate(){
   finally{ btn.disabled=false; btn.textContent="Generate PowerPoint"; }
 }
 
+async function diagnose(){
+  clearErr();
+  const out = $("#diagOut");
+  out.style.display="block"; out.textContent="Running diagnostics…";
+  try{
+    const d = await (await fetch("/api/diagnose?url=" + encodeURIComponent(urlEl.value.trim()))).json();
+    out.textContent = JSON.stringify(d, null, 2);
+  }catch(e){ out.textContent = "Could not reach the server."; }
+}
+
 $("#previewBtn").onclick = preview;
 $("#generateBtn").onclick = generate;
+$("#diagnoseBtn").onclick = diagnose;
 urlEl.addEventListener("keydown", e=>{ if(e.key==="Enter") preview(); });
 
 // ---------- settings / config ----------

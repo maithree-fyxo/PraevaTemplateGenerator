@@ -115,6 +115,13 @@ def preview(url: str = ""):
     }
 
 
+@app.get("/api/diagnose")
+def diagnose(url: str = ""):
+    """Structural diagnostics for an empty/unexpected live result.
+    Returns statuses, key names, counts and pipeline-tag texts — no personal data."""
+    return ezekia.diagnose(url)
+
+
 @app.post("/api/generate")
 def generate(req: GenerateRequest):
     try:

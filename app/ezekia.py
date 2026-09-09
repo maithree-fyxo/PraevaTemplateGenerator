@@ -377,6 +377,81 @@ def test_token() -> Dict[str, Any]:
         return {"ok": False, "status": None, "detail": f"Connection error: {e}"}
 
 
+def diagnose(url: str) -> Dict[str, Any]:
+    """Report the STRUCTURE of what Ezekia returns for a URL, to debug empty
+    results. Safe: returns statuses, key names, counts and pipeline-tag texts —
+    no candidate names or personal data."""
+    out: Dict[str, Any] = {"mock_mode": use_mock()}
+    if use_mock():
+        out["note"] = "App is in demo mode (no token). Set a token to hit live Ezekia."
+        return out
+    try:
+        assignment_id = extract_assignment_id(url)
+    except EzekiaError as e:
+        out["error"] = str(e)
+        return out
+    out["assignment_id"] = assignment_id
+
+    token = config.get_ezekia_token()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    params = [("fieldsWithCandidate[]", f) for f in CANDIDATE_INCLUDES] + [("count", "500")]
+
+    with httpx.Client(timeout=45.0, headers=headers) as client:
+        # --- project ---
+        pr = client.get(f"{BASE_URL}/v4/projects/{assignment_id}")
+        proj_info: Dict[str, Any] = {"http_status": pr.status_code}
+        if pr.status_code == 200:
+            body = pr.json()
+            proj_info["envelope_keys"] = list(body.keys())
+            data = body.get("data", body)
+            proj_info["data_keys"] = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+            proj_info["client_name_detected"] = _client_name(data if isinstance(data, dict) else {})
+        else:
+            proj_info["body_snippet"] = pr.text[:200]
+        out["project"] = proj_info
+
+        # --- candidates ---
+        cr = client.get(f"{BASE_URL}/v4/projects/{assignment_id}/candidates", params=params)
+        cand_info: Dict[str, Any] = {"http_status": cr.status_code, "params_sent": [p[0]+"="+p[1] for p in params]}
+        if cr.status_code == 200:
+            body = cr.json()
+            cand_info["envelope_keys"] = list(body.keys()) if isinstance(body, dict) else type(body).__name__
+            data = body.get("data", body) if isinstance(body, dict) else body
+            items = data if isinstance(data, list) else []
+            cand_info["raw_count"] = len(items)
+            # where do pipeline tags live? sample first item's key paths
+            if items:
+                first = items[0]
+                cand_info["sample_top_keys"] = list(first.keys()) if isinstance(first, dict) else type(first).__name__
+                cand_info["sample_meta_keys"] = list(_g(first, "meta", default={}).keys()) if isinstance(_g(first, "meta"), dict) else None
+                cand_info["sample_candidateInfo_keys"] = list(_g(first, "meta", "candidateInfo", default={}).keys()) if isinstance(_g(first, "meta", "candidateInfo"), dict) else None
+                cand_info["sample_has_profile"] = "profile" in first if isinstance(first, dict) else False
+            # tag census + routing
+            tag_census: Dict[str, int] = {}
+            routed = {"engaged": 0, "pipeline": 0, "discounted_profile": 0, "discounted_table": 0, "excluded": 0}
+            for it in items:
+                tags = _g(it, "meta", "candidateInfo", "pipelineTags", default=[]) or []
+                texts = [t.get("text", "") for t in tags if isinstance(t, dict) and t.get("text")]
+                for t in texts:
+                    tag_census[t] = tag_census.get(t, 0) + 1
+                route = _candidate_route(it)
+                if route is None:
+                    routed["excluded"] += 1
+                else:
+                    stage, _, has_profile = route
+                    if stage == Stage.ENGAGED: routed["engaged"] += 1
+                    elif stage == Stage.PIPELINE: routed["pipeline"] += 1
+                    elif stage == Stage.DISCOUNTED and has_profile: routed["discounted_profile"] += 1
+                    elif stage == Stage.DISCOUNTED: routed["discounted_table"] += 1
+            cand_info["pipeline_tags_seen"] = tag_census
+            cand_info["routed_counts"] = routed
+        else:
+            cand_info["body_snippet"] = cr.text[:200]
+        out["candidates"] = cand_info
+
+    return out
+
+
 def get_assignment_from_url(url: str) -> Assignment:
     """Full pipeline: URL -> Assignment. Uses mock data in demo mode."""
     if use_mock():
