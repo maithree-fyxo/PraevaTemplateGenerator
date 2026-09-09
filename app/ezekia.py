@@ -45,6 +45,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -395,7 +396,7 @@ def map_assignment(raw: Dict[str, Any]) -> Assignment:
         name=client_name,
         title=f"Search Update – {client_name}" if client_name else (project.get("title") or "Search Update"),
         prepared_for=_prepared_for(raw_contacts),
-        date="",  # report date is chosen at generation time; left blank to fill in deck
+        date=datetime.now().strftime("%d %B %Y"),  # generation date, shown on cover
     )
     for rc in raw_candidates:
         cand = _map_candidate(rc)

@@ -295,31 +295,43 @@ def _proto_run(paragraph):
 
 
 def _render_cell_lines(cell, lines):
-    """Rebuild a table cell's paragraphs to exactly `lines` — a list of
-    (text, proto_run_element). Each line becomes one paragraph cloned from the
-    cell's first paragraph (keeping its paragraph props), carrying one run
-    cloned from proto_run_element (keeping its font). proto_run may be None."""
+    """Rebuild a table cell as ONE paragraph whose lines are separated by
+    <a:br> — matching the template's tight, aligned career layout (company
+    then roles beneath; blank then dates beneath). `lines` is a list of
+    (text, proto_run_element); each becomes a run cloned from proto_run_element
+    (preserving its font, e.g. bold company vs regular role). Using a single
+    paragraph with line breaks (rather than separate paragraphs) avoids the
+    inter-paragraph spacing that was pushing roles out of line with dates."""
     tf = cell.text_frame
     txBody = tf._txBody
-    # paragraph-props prototype: the existing first <a:p>, stripped of runs/breaks
-    base_p = copy.deepcopy(txBody.find(qn("a:p")))
-    if base_p is not None:
-        for child in base_p.findall(qn("a:r")) + base_p.findall(qn("a:br")):
-            base_p.remove(child)
-    # remove all existing paragraphs (but keep bodyPr / lstStyle)
+    # keep the paragraph props (e.g. right-align on the dates cell) from para 0
+    first_p = txBody.find(qn("a:p"))
+    pPr = None
+    if first_p is not None:
+        pPr_el = first_p.find(qn("a:pPr"))
+        if pPr_el is not None:
+            pPr = copy.deepcopy(pPr_el)
+    # remove all existing paragraphs (keep bodyPr / lstStyle)
     for p in txBody.findall(qn("a:p")):
         txBody.remove(p)
-    for text, proto_run in lines:
-        new_p = copy.deepcopy(base_p) if base_p is not None else txBody.makeelement(qn("a:p"), {})
+
+    new_p = txBody.makeelement(qn("a:p"), {})
+    if pPr is not None:
+        new_p.append(pPr)
+    for i, (text, proto_run) in enumerate(lines):
+        if i > 0:
+            new_p.append(new_p.makeelement(qn("a:br"), {}))
         if proto_run is not None:
             new_r = copy.deepcopy(proto_run)
-            t = new_r.find(qn("a:t"))
-            if t is None:
-                t = new_r.makeelement(qn("a:t"), {})
-                new_r.append(t)
-            t.text = _s(text)
-            new_p.append(new_r)
-        txBody.append(new_p)
+        else:
+            new_r = new_p.makeelement(qn("a:r"), {})
+        t = new_r.find(qn("a:t"))
+        if t is None:
+            t = new_r.makeelement(qn("a:t"), {})
+            new_r.append(t)
+        t.text = _s(text)
+        new_p.append(new_r)
+    txBody.append(new_p)
 
 
 def _fill_career_row(table, row_idx: int, group: CareerGroup):
