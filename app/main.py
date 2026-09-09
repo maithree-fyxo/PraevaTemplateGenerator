@@ -23,12 +23,12 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, ezekia, pptx_engine
+from . import config, ezekia, pptx_engine, excel_ingest
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "praeva_search_update.pptx")
@@ -140,6 +140,59 @@ def generate(req: GenerateRequest):
     # browser keeps the full "Praeva Search Update - <company> - <date>.pptx"
     # name. (Starlette's FileResponse switches to the filename*=utf-8'' form
     # when the name has spaces, which the frontend then can't parse.)
+    from urllib.parse import quote
+    headers = {
+        "Content-Disposition": f'attachment; filename="{fname}"; '
+                               f"filename*=UTF-8''{quote(fname)}"
+    }
+    return FileResponse(
+        out_path,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers=headers,
+    )
+
+
+# --- Excel-upload path ---------------------------------------------------- #
+def _counts(a):
+    return {
+        "assignment": a.name,
+        "title": a.title,
+        "date": a.date,
+        "counts": {
+            "engaged_profiles": len(a.engaged()),
+            "pipeline_table": len(a.pipeline()),
+            "discounted_profiles": len(a.discounted_profiles()),
+            "discounted_table": len(a.discounted_table()),
+            "target": "manual",
+        },
+    }
+
+
+@app.post("/api/preview-from-excel")
+async def preview_from_excel(file: UploadFile = File(...)):
+    data = await file.read()
+    try:
+        a = excel_ingest.assignment_from_excel(io.BytesIO(data))
+    except excel_ingest.ExcelIngestError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _counts(a)
+
+
+@app.post("/api/generate-from-excel")
+async def generate_from_excel(file: UploadFile = File(...)):
+    data = await file.read()
+    try:
+        assignment = excel_ingest.assignment_from_excel(io.BytesIO(data))
+    except excel_ingest.ExcelIngestError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    fname = _safe_filename(assignment.name)
+    out_path = os.path.join("/tmp", fname)
+    try:
+        pptx_engine.generate(assignment, TEMPLATE_PATH, out_path)
+    except Exception as e:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Failed to build deck: {e}")
+
     from urllib.parse import quote
     headers = {
         "Content-Disposition": f'attachment; filename="{fname}"; '
