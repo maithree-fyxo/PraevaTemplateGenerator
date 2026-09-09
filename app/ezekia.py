@@ -78,28 +78,48 @@ TAG_FIELDS_PARAM = ("fields", "meta.candidate")
 # Back-compat alias (diagnose + any external refs).
 CANDIDATE_INCLUDES = PROFILE_INCLUDES
 
-# How each Ezekia pipeline tag (lower-cased) routes into the report.
-# Value = (Stage, has_profile):
+# How each Ezekia pipeline tag routes into the report.
+#
+# Candidates carry MULTIPLE tags (e.g. "Identified" + "Phone Interview" +
+# "Not Interested"), so routing is by PRIORITY: the highest-priority tag a
+# candidate holds decides their section. Tag names are matched case-insensitively.
+#
+# Priority policy = EXIT-WINS (confirmed with Praeva): a negative/exit tag
+# overrides any earlier progress, so a candidate who was interviewed but then
+# declined shows in Discounted, not Engaged. The Discounted block therefore sits
+# ABOVE the progress block below. Within progress, the most-advanced stage wins.
+#
+# Each entry: (exact tag text, Stage, has_profile)
 #   has_profile=True  -> full profile format (2 per page)
 #   has_profile=False -> list-table format
-# EDIT here if Praeva renames its pipeline stages.
-#
-# Praeva's mapping:
-#   Phone Interview / Praeva Interview -> Engaged        -> full profile
-#   In discussion                      -> Pipeline       -> table
-#   Not Interested                     -> Discounted     -> table
-#   Praeva discounted                  -> Discounted     -> full profile
-#   (Target section is filled manually -> placeholders, no tag routes here)
-TAG_ROUTING: Dict[str, tuple[Stage, bool]] = {
-    "phone interview": (Stage.ENGAGED, True),
-    "praeva interview": (Stage.ENGAGED, True),
-    "in discussion": (Stage.PIPELINE, False),
-    "not interested": (Stage.DISCOUNTED, False),
-    "praeva discounted": (Stage.DISCOUNTED, True),
+# EDIT this ordered list if Praeva renames or re-prioritises its pipeline stages.
+TAG_ROUTING: List[tuple[str, Stage, bool]] = [
+    # --- exits (win over progress) ---
+    ("Praeva - Discounted", Stage.DISCOUNTED, True),   # Praeva-side discount -> profile
+    ("Not Interested",      Stage.DISCOUNTED, False),  # candidate declined   -> table
+    # --- progress (most-advanced first) ---
+    ("Praeva Interview",    Stage.ENGAGED,   True),
+    ("Phone Interview",     Stage.ENGAGED,   True),
+    ("In Discussion",       Stage.PIPELINE,  False),
+]
+# Lower-cased lookup + explicit priority index (position in the list above).
+_TAG_ROUTE_BY_TEXT: Dict[str, tuple[int, Stage, bool]] = {
+    text.strip().lower(): (i, stage, has_profile)
+    for i, (text, stage, has_profile) in enumerate(TAG_ROUTING)
 }
-# Candidates whose pipeline tags match none of the above are left OUT of the
-# report (e.g. brand-new/unclassified candidates, or Target-section people who
-# are added manually).
+# SUPPRESS tags: holding ANY of these removes the candidate from the deck
+# entirely, even if they also carry a routed tag (per Praeva — these people
+# should never surface). Terminal exits + the advanced Client-Interview stage
+# they chose not to show.
+SUPPRESS_TAGS = {
+    "client interview",
+    "stood down - praeva",
+    "withdrew",
+}
+# IGNORE tags (neutral, no effect on routing): Tier 2, Leave, Source,
+# Contact - No reply, Identified (the base longlist tag on all candidates).
+# A candidate carrying only these (and no routed tag) is excluded by default.
+# The Target section is filled manually (placeholders), so no tag routes there.
 
 CURRENCY_SYMBOLS = {"GBP": "£", "USD": "$", "EUR": "€", "AUD": "A$", "CAD": "C$"}
 
@@ -312,19 +332,30 @@ def _prepared_for(contacts: List[Dict[str, Any]]) -> List[str]:
 
 
 def _candidate_route(person: Dict[str, Any]):
-    """Return (stage, status_label, has_profile) from pipeline tags, or None if
-    the candidate matches no routed tag (and so is excluded from the report)."""
-    # v4 exposes candidate pipeline info under meta.candidate (api.v4.person.meta.candidate).
-    # Fall back to the older meta.candidateInfo path just in case.
+    """Return (stage, status_label, has_profile) for the candidate's HIGHEST-
+    priority pipeline tag, or None if they hold no routed tag (excluded).
+
+    Candidates carry several tags at once; we pick the one with the lowest
+    priority index in TAG_ROUTING (exit tags rank above progress tags)."""
+    # v4/non-v4 both expose pipeline info under meta.candidate. Fall back to the
+    # older meta.candidateInfo path just in case.
     tags = (_g(person, "meta", "candidate", "pipelineTags", default=None)
             or _g(person, "meta", "candidateInfo", "pipelineTags", default=[]) or [])
     texts = [t.get("text", "") for t in tags if isinstance(t, dict) and t.get("text")]
+    # A suppress tag removes the candidate entirely, overriding any routed tag.
+    if any(txt.strip().lower() in SUPPRESS_TAGS for txt in texts):
+        return None
+    best = None  # (priority_index, stage, label, has_profile)
     for txt in texts:
-        route = TAG_ROUTING.get(txt.strip().lower())
+        route = _TAG_ROUTE_BY_TEXT.get(txt.strip().lower())
         if route is not None:
-            stage, has_profile = route
-            return stage, txt.strip(), has_profile
-    return None
+            idx, stage, has_profile = route
+            if best is None or idx < best[0]:
+                best = (idx, stage, txt.strip(), has_profile)
+    if best is None:
+        return None
+    _, stage, label, has_profile = best
+    return stage, label, has_profile
 
 
 def _map_candidate(person: Dict[str, Any]) -> Optional[Candidate]:
