@@ -17,7 +17,8 @@ Key endpoints
        &fieldsWithCandidate[]=profile.confidential
        &fieldsWithCandidate[]=profile.currentStatus
        &fieldsWithCandidate[]=profile.aspirations
-     -> each person embeds profile.* AND meta.candidateInfo.pipelineTags
+       &fieldsWithCandidate[]=meta.candidate
+     -> each person embeds profile.* AND meta.candidate.pipelineTags
   GET /v4/projects/{id}/contacts             -> { data: [person] }  (Prepared for)
 
 Auth: Bearer token (set EZEKIA_TOKEN). Demo mode (mock data) is used when no
@@ -55,7 +56,10 @@ def use_mock() -> bool:
     return config.use_mock()
 
 # Fields to embed on the candidates call (one round-trip for the whole deck).
+# `meta.candidate` is the candidate-specific include (api.v4.person.candidate enum)
+# that makes Ezekia return meta.candidate.pipelineTags — the pipeline routing tags.
 CANDIDATE_INCLUDES = [
+    "meta.candidate",
     "profile.positions",
     "profile.education",
     "profile.confidential",
@@ -223,10 +227,11 @@ def _client_name(project: Dict[str, Any]) -> str:
     project.default has no single guaranteed 'company' field, so try the most
     likely places. CONFIRM this against a real assignment on first live run.
     """
-    for path in (("company",), ("company", "name"),
+    for path in (("relationships", "company", "name"),
+                 ("relationships", "client", "name"),
                  ("relationships", "company", "data", "name"),
-                 ("relationships", "companies", "data", 0, "name"),
-                 ("meta", "company"), ("name",), ("label",), ("projectId",), ("title",)):
+                 ("company", "name"), ("company",),
+                 ("name",), ("label",), ("projectId",), ("title",)):
         v = _g_path(project, path)
         if isinstance(v, str) and v.strip():
             return v.strip()
@@ -258,7 +263,10 @@ def _prepared_for(contacts: List[Dict[str, Any]]) -> List[str]:
 def _candidate_route(person: Dict[str, Any]):
     """Return (stage, status_label, has_profile) from pipeline tags, or None if
     the candidate matches no routed tag (and so is excluded from the report)."""
-    tags = _g(person, "meta", "candidateInfo", "pipelineTags", default=[]) or []
+    # v4 exposes candidate pipeline info under meta.candidate (api.v4.person.meta.candidate).
+    # Fall back to the older meta.candidateInfo path just in case.
+    tags = (_g(person, "meta", "candidate", "pipelineTags", default=None)
+            or _g(person, "meta", "candidateInfo", "pipelineTags", default=[]) or [])
     texts = [t.get("text", "") for t in tags if isinstance(t, dict) and t.get("text")]
     for txt in texts:
         route = TAG_ROUTING.get(txt.strip().lower())
@@ -291,7 +299,9 @@ def _map_candidate(person: Dict[str, Any]) -> Optional[Candidate]:
         education=_education(profile.get("education", [])),
         career=_career(positions),
     )
-    cand.__dict__["_rank"] = _g(person, "meta", "candidateInfo", "rank", default=1_000_000)
+    cand.__dict__["_rank"] = (_g(person, "meta", "candidate", "rank", default=None)
+                              if _g(person, "meta", "candidate", "rank", default=None) is not None
+                              else _g(person, "meta", "candidateInfo", "rank", default=1_000_000))
     return cand
 
 
@@ -348,6 +358,13 @@ def _salary(profile: Dict[str, Any]) -> str:
 
 
 def _location(profile: Dict[str, Any]) -> str:
+    # v4 currentStatus (api.v3.person.currentStatus) exposes a `locations` array.
+    cur_locs = _g(profile, "currentStatus", "locations", default=[]) or []
+    if cur_locs and isinstance(cur_locs[0], dict):
+        nm = cur_locs[0].get("name")
+        if nm:
+            return nm
+    # older singular shape, just in case
     loc = _g(profile, "currentStatus", "location", "name")
     if loc:
         return loc
@@ -468,13 +485,15 @@ def diagnose(url: str) -> Dict[str, Any]:
                 first = items[0]
                 cand_info["sample_top_keys"] = list(first.keys()) if isinstance(first, dict) else type(first).__name__
                 cand_info["sample_meta_keys"] = list(_g(first, "meta", default={}).keys()) if isinstance(_g(first, "meta"), dict) else None
+                cand_info["sample_candidate_keys"] = list(_g(first, "meta", "candidate", default={}).keys()) if isinstance(_g(first, "meta", "candidate"), dict) else None
                 cand_info["sample_candidateInfo_keys"] = list(_g(first, "meta", "candidateInfo", default={}).keys()) if isinstance(_g(first, "meta", "candidateInfo"), dict) else None
                 cand_info["sample_has_profile"] = "profile" in first if isinstance(first, dict) else False
             # tag census + routing
             tag_census: Dict[str, int] = {}
             routed = {"engaged": 0, "pipeline": 0, "discounted_profile": 0, "discounted_table": 0, "excluded": 0}
             for it in items:
-                tags = _g(it, "meta", "candidateInfo", "pipelineTags", default=[]) or []
+                tags = (_g(it, "meta", "candidate", "pipelineTags", default=None)
+                        or _g(it, "meta", "candidateInfo", "pipelineTags", default=[]) or [])
                 texts = [t.get("text", "") for t in tags if isinstance(t, dict) and t.get("text")]
                 for t in texts:
                     tag_census[t] = tag_census.get(t, 0) + 1
@@ -517,6 +536,35 @@ def diagnose(url: str) -> Dict[str, Any]:
                     entry["items"] = 0
             probe[guess] = entry
         out["tag_field_probe"] = probe
+
+        # --- full nested key paths of the first candidate (keys only) ---
+        try:
+            cr2 = client.get(f"{BASE_URL}/v4/projects/{assignment_id}/candidates",
+                             params=[("fieldsWithCandidate[]", f) for f in CANDIDATE_INCLUDES] + [("count", "1")])
+            items = (cr2.json() or {}).get("data", [])
+            if items:
+                out["first_candidate_all_keypaths"] = _key_paths(items[0], cap=300)
+        except Exception as e:
+            out["first_candidate_all_keypaths"] = f"error: {e}"
+
+        # --- pull the OpenAPI spec to find the real candidate include names ---
+        try:
+            sp = client.get("https://ezekia.com/docs?api-docs.json")
+            if sp.status_code == 200:
+                schemas = (sp.json().get("components") or {}).get("schemas", {})
+                import json as _json
+                spec_out = {}
+                for key in ("api.v4.person.candidate", "api.v4.person.meta",
+                            "api.v4.person.meta.candidate", "api.v4.person.meta.candidateInfo",
+                            "api.v4.person.fieldWithCandidate", "api.v4.person.field"):
+                    node = schemas.get(key)
+                    if node is not None:
+                        spec_out[key] = _json.dumps(node)[:1200]
+                out["spec_schemas"] = spec_out
+            else:
+                out["spec_schemas"] = {"http_status": sp.status_code}
+        except Exception as e:
+            out["spec_schemas"] = {"error": str(e)[:120]}
 
     return out
 
