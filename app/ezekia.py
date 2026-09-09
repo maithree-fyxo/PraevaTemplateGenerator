@@ -75,6 +75,21 @@ PROFILE_INCLUDES = [
 # `fields=meta.candidate` parameter (confirmed against Ezekia support docs).
 TAG_FIELDS_PARAM = ("fields", "meta.candidate")
 
+# CONFIRMED via diagnose probe: the /v4 candidates endpoint returns ONLY
+# profile.positions and IGNORES fieldsWithCandidate[] for every other block
+# (currentStatus/confidential/education/aspirations all came back 0/93).
+# Those blocks — like the pipeline tags — are only returned by the non-versioned
+# endpoint via `fields=`. We fetch them there and merge by candidate id.
+NONV4_FIELDS = [
+    "meta.candidate",
+    "profile.positions",
+    "profile.currentStatus",   # location
+    "profile.confidential",    # salary, notice
+    "profile.education",
+    "profile.aspirations",
+]
+NONV4_FIELDS_PARAM = ("fields", ",".join(NONV4_FIELDS))
+
 # Back-compat alias (diagnose + any external refs).
 CANDIDATE_INCLUDES = PROFILE_INCLUDES
 
@@ -168,24 +183,27 @@ class EzekiaClient:
     def fetch_raw(self, assignment_id: str) -> Dict[str, Any]:
         profile_params = [("fieldsWithCandidate[]", f) for f in PROFILE_INCLUDES]
         profile_params.append(("count", "500"))
-        tag_params = [TAG_FIELDS_PARAM, ("count", "500")]
+        # The non-v4 endpoint returns everything the v4 endpoint omits
+        # (currentStatus/confidential/education/aspirations) PLUS meta.candidate.
+        block_params = [NONV4_FIELDS_PARAM, ("count", "500")]
         with httpx.Client(timeout=self.timeout, headers=self._headers()) as client:
             project = self._get(client, f"/v4/projects/{assignment_id}").get("data", {})
 
-            # 1) rich profile records from the v4 endpoint
+            # 1) base records from the v4 endpoint (positions + addresses)
             candidates = self._get(
                 client, f"/v4/projects/{assignment_id}/candidates", params=profile_params
             ).get("data", []) or []
 
-            # 2) pipeline tags from the documented non-v4 endpoint, merged by id
-            tagged = []
+            # 2) tags + the omitted profile blocks from the documented non-v4
+            #    endpoint, merged into the base records by id
+            extra = []
             try:
-                tagged = self._get(
-                    client, f"/projects/{assignment_id}/candidates", params=tag_params
+                extra = self._get(
+                    client, f"/projects/{assignment_id}/candidates", params=block_params
                 ).get("data", []) or []
             except EzekiaError:
-                tagged = []
-            candidates = _merge_meta(candidates, tagged)
+                extra = []
+            candidates = _merge_records(candidates, extra)
 
             try:
                 contacts = self._get(client, f"/v4/projects/{assignment_id}/contacts").get("data", [])
@@ -236,6 +254,40 @@ def _merge_meta(profiles: List[Dict[str, Any]], tagged: List[Dict[str, Any]]) ->
             # keep anything already present; layer the tag meta underneath
             c["meta"] = {**incoming, **existing} if isinstance(existing, dict) else incoming
     return profiles
+
+
+def _merge_records(base: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge the non-v4 `extra` records (meta.candidate + the profile blocks the
+    v4 endpoint omits) into the rich v4 `base` records, keyed by candidate id.
+    Fills gaps only — never overwrites data the base already has."""
+    if not base:
+        return extra
+    ex_by_id = {r.get("id"): r for r in extra
+                if isinstance(r, dict) and r.get("id") is not None}
+    for c in base:
+        if not isinstance(c, dict):
+            continue
+        e = ex_by_id.get(c.get("id"))
+        if not e:
+            continue
+        # meta (pipeline tags)
+        if isinstance(e.get("meta"), dict) and e["meta"]:
+            existing = c.get("meta")
+            c["meta"] = {**e["meta"], **existing} if isinstance(existing, dict) else e["meta"]
+        # profile sub-blocks (currentStatus/confidential/education/aspirations/positions)
+        eprof = e.get("profile")
+        if isinstance(eprof, dict):
+            cprof = c.get("profile")
+            if not isinstance(cprof, dict):
+                cprof = {}
+                c["profile"] = cprof
+            for k, v in eprof.items():
+                if v not in (None, "", [], {}) and cprof.get(k) in (None, "", [], {}):
+                    cprof[k] = v
+        # top-level addresses
+        if not c.get("addresses") and e.get("addresses"):
+            c["addresses"] = e["addresses"]
+    return base
 
 
 def _g(d: Any, *keys, default=None):
@@ -712,8 +764,24 @@ def diagnose(url: str) -> Dict[str, Any]:
             cand_info["envelope_keys"] = list(body.keys()) if isinstance(body, dict) else type(body).__name__
             data = body.get("data", body) if isinstance(body, dict) else body
             items = data if isinstance(data, list) else []
-            # merge in the pipeline meta fetched above, exactly like production
-            items = _merge_meta(items, [{"id": k, "meta": v} for k, v in meta_by_id.items()])
+            # fetch the omitted profile blocks + tags from the non-v4 endpoint and
+            # merge, exactly like production
+            blocks_info: Dict[str, Any] = {
+                "endpoint": f"/projects/{assignment_id}/candidates?fields={NONV4_FIELDS_PARAM[1]}"
+            }
+            try:
+                br = client.get(f"{BASE_URL}/projects/{assignment_id}/candidates",
+                                params=[NONV4_FIELDS_PARAM, ("count", "500")])
+                blocks_info["http_status"] = br.status_code
+                if br.status_code == 200:
+                    bitems = (br.json() or {}).get("data", []) or []
+                    blocks_info["raw_count"] = len(bitems)
+                    items = _merge_records(items, bitems)
+                else:
+                    blocks_info["body_snippet"] = br.text[:200]
+            except Exception as e:  # pragma: no cover
+                blocks_info["error"] = str(e)[:120]
+            out["blocks_fetch"] = blocks_info
             cand_info["raw_count"] = len(items)
             cand_info["merged_with_tags"] = len(meta_by_id)
             # where do pipeline tags live? sample first item's key paths
