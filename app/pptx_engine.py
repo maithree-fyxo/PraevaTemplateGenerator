@@ -31,7 +31,7 @@ from pptx import Presentation
 from pptx.util import Emu
 from pptx.oxml.ns import qn
 
-from .models import Assignment, Candidate, CareerEntry
+from .models import Assignment, Candidate, CareerEntry, CareerGroup
 
 # Column split (inches) for the two-up profile layout
 _COL_SPLIT_IN = 5.0
@@ -257,14 +257,18 @@ def _profile_slots(slide):
     return slots
 
 
-def _fill_career_table(table_shape, career: List[CareerEntry]):
-    """Rebuild the career table to exactly len(career) rows.
+def _fill_career_table(table_shape, career: List[CareerGroup]):
+    """Rebuild the career table to one ROW PER COMPANY GROUP.
 
-    The template's original rows mix two structures (some use an <a:br> line
-    break, some use a real paragraph break). To stay robust we take row 0 as
-    the single style prototype (company run bold + <a:br> + role run; dates in
-    the right cell) and rebuild every row from a deep copy of it, so all rows
-    share one clean, predictable structure.
+    Each group renders as a multi-line block:
+        Google              (company, bold — run0 style)
+        Director   2024 - P (role, regular — run1 style)
+        VP         2022 - 2024
+    The left cell holds the company then each role on its own line; the right
+    cell holds a blank line (aligning with the company) then each role's dates.
+    Row 0 is the style prototype (company-bold run + role run; dates run in the
+    right cell); every row is rebuilt from a deep copy of it so fonts/borders
+    are preserved.
     """
     tbl = table_shape.table._tbl
     trs = tbl.findall(qn("a:tr"))
@@ -275,61 +279,75 @@ def _fill_career_table(table_shape, career: List[CareerEntry]):
     for tr in trs:
         tbl.remove(tr)
 
-    entries = career if career else [CareerEntry(company="", role="", dates="")]
-    for _ in entries:
+    groups = career if career else [CareerGroup(company="", roles=[CareerEntry(role="", dates="")])]
+    for _ in groups:
         tbl.append(copy.deepcopy(proto_tr))
 
     table = table_shape.table
-    for i, entry in enumerate(entries):
-        _fill_career_row(table, i, entry)
+    for i, grp in enumerate(groups):
+        _fill_career_row(table, i, grp)
 
 
-def _fill_career_row(table, row_idx: int, entry: CareerEntry):
+def _proto_run(paragraph):
+    """Deep-copy the first run element of a paragraph (style prototype), or None."""
+    runs = paragraph.runs
+    return copy.deepcopy(runs[0]._r) if runs else None
+
+
+def _render_cell_lines(cell, lines):
+    """Rebuild a table cell's paragraphs to exactly `lines` — a list of
+    (text, proto_run_element). Each line becomes one paragraph cloned from the
+    cell's first paragraph (keeping its paragraph props), carrying one run
+    cloned from proto_run_element (keeping its font). proto_run may be None."""
+    tf = cell.text_frame
+    txBody = tf._txBody
+    # paragraph-props prototype: the existing first <a:p>, stripped of runs/breaks
+    base_p = copy.deepcopy(txBody.find(qn("a:p")))
+    if base_p is not None:
+        for child in base_p.findall(qn("a:r")) + base_p.findall(qn("a:br")):
+            base_p.remove(child)
+    # remove all existing paragraphs (but keep bodyPr / lstStyle)
+    for p in txBody.findall(qn("a:p")):
+        txBody.remove(p)
+    for text, proto_run in lines:
+        new_p = copy.deepcopy(base_p) if base_p is not None else txBody.makeelement(qn("a:p"), {})
+        if proto_run is not None:
+            new_r = copy.deepcopy(proto_run)
+            t = new_r.find(qn("a:t"))
+            if t is None:
+                t = new_r.makeelement(qn("a:t"), {})
+                new_r.append(t)
+            t.text = _s(text)
+            new_p.append(new_r)
+        txBody.append(new_p)
+
+
+def _fill_career_row(table, row_idx: int, group: CareerGroup):
     left = table.cell(row_idx, 0)
     right = table.cell(row_idx, 1)
 
-    # LEFT cell: para0 has run0 (company, bold) + <a:br> + run1 (role)
-    company, role = _s(entry.company), _s(entry.role)
-    p0 = left.text_frame.paragraphs[0]
-    runs = p0.runs
-    if len(runs) >= 2:
-        runs[0].text = company
-        runs[1].text = role
-        for r in runs[2:]:
-            r._r.getparent().remove(r._r)
-    elif len(runs) == 1:
-        runs[0].text = company if not role else f"{company}  {role}"
-    # blank any extra paragraphs in the left cell
-    for extra in left.text_frame.paragraphs[1:]:
-        for r in extra.runs:
-            r.text = ""
-
-    # RIGHT cell: dates live in the first paragraph that has a run
-    _set_dates_cell(right, entry.dates)
-
-
-def _set_dates_cell(cell, dates: str):
-    dates = _s(dates)
-    target_para = None
-    for para in cell.text_frame.paragraphs:
+    # capture style prototypes from the cloned prototype row's cells
+    lp0 = left.text_frame.paragraphs[0]
+    lruns = lp0.runs
+    company_proto = copy.deepcopy(lruns[0]._r) if len(lruns) >= 1 else None
+    role_proto = copy.deepcopy(lruns[1]._r) if len(lruns) >= 2 else company_proto
+    date_proto = None
+    for para in right.text_frame.paragraphs:
         if para.runs:
-            target_para = para
+            date_proto = copy.deepcopy(para.runs[0]._r)
             break
-    if target_para is None:
-        target_para = cell.text_frame.paragraphs[-1]
-    if target_para.runs:
-        target_para.runs[0].text = dates
-        for r in target_para.runs[1:]:
-            r._r.getparent().remove(r._r)
-    else:
-        target_para.text = dates
-    # clear other paragraphs' runs (compare underlying XML, not wrappers,
-    # because .paragraphs returns fresh wrapper objects each call)
-    for para in cell.text_frame.paragraphs:
-        if para._p is target_para._p:
-            continue
-        for r in para.runs:
-            r.text = ""
+
+    # LEFT: company (bold) then each role (regular)
+    left_lines = [(_s(group.company), company_proto)]
+    for e in group.roles:
+        left_lines.append((_s(e.role), role_proto))
+    _render_cell_lines(left, left_lines)
+
+    # RIGHT: blank line (aligns with company) then each role's dates
+    right_lines = [("", date_proto)]
+    for e in group.roles:
+        right_lines.append((_s(e.dates), date_proto))
+    _render_cell_lines(right, right_lines)
 
 
 def _fill_profile_column(slots_col: dict, cand: Optional[Candidate]):
@@ -348,6 +366,8 @@ def _fill_profile_column(slots_col: dict, cand: Optional[Candidate]):
         return
 
     put("name", cand.name)
+    if cand.name_url:
+        _hyperlink_shape(slots_col.get("name"), cand.name_url)
     put("location", cand.location)
     put("salary", cand.salary)
     put("availability", cand.availability)
@@ -355,6 +375,19 @@ def _fill_profile_column(slots_col: dict, cand: Optional[Candidate]):
     tbl = slots_col.get("career_table")
     if tbl is not None:
         _fill_career_table(tbl, cand.career)
+
+
+def _hyperlink_shape(shape, url: str):
+    """Make the first run of a text shape a hyperlink to `url`."""
+    if shape is None or not url or not shape.has_text_frame:
+        return
+    for para in shape.text_frame.paragraphs:
+        if para.runs:
+            try:
+                para.runs[0].hyperlink.address = url
+            except Exception:
+                pass
+            return
 
 
 # slide background colour (theme tx2) — used to mask an empty profile slot

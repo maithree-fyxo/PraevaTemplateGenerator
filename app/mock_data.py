@@ -4,15 +4,28 @@ Mock assignment data mirroring the sample values in the supplied template.
 Used to develop & test the PPTX engine before the live Ezekia API is wired.
 When the real API is connected, ezekia.py produces the same Assignment shape.
 """
-from .models import Assignment, Candidate, CareerEntry, Stage
+from .models import Assignment, Candidate, CareerEntry, CareerGroup, Stage
 
 
 def _c(company, role, dates):
-    return CareerEntry(company=company, role=role, dates=dates)
+    # kept as a (company, role, dates) tuple; grouped into CareerGroups below
+    return (company, role, dates)
+
+
+def _group(rows):
+    """Group consecutive same-company (company, role, dates) tuples into CareerGroups."""
+    groups = []
+    for company, role, dates in rows:
+        entry = CareerEntry(role=role, dates=dates)
+        if groups and groups[-1].company.strip().lower() == company.strip().lower():
+            groups[-1].roles.append(entry)
+        else:
+            groups.append(CareerGroup(company=company, roles=[entry]))
+    return groups
 
 
 def mock_assignment() -> Assignment:
-    return Assignment(
+    a = Assignment(
         name="Campfire",
         title="Search Update – Campfire",
         prepared_for=[
@@ -24,12 +37,14 @@ def mock_assignment() -> Assignment:
             # -------- Engaged (full profiles) --------
             Candidate(
                 name="Will Engert", stage=Stage.ENGAGED, has_profile=True,
+                name_url="https://www.linkedin.com/in/will-engert",
                 salary="£220,000 base, bonus, LTIP",
                 location="London, open to commuting",
                 availability="4 months",
                 education="ICAEW\t2011 - 2014\nACA, Accounting",
                 career=[
-                    _c("Publicis Groupe", "Chief Commercial Officer, Media", "2025 - present"),
+                    _c("Publicis Groupe", "Chief Commercial Officer, Media", "2025 - P"),
+                    _c("Publicis Groupe", "Managing Director", "2024 - 2025"),
                     _c("Independent Consultant", "Finance, Operational & Commercial Consultancy", "2024 - 2025"),
                     _c("The & Partnership", "Chief Operating Officer & Partner", "2020 - 2024"),
                     _c("UK Government", "Project Director at FCDO", "2019 - 2020"),
@@ -100,3 +115,8 @@ def mock_assignment() -> Assignment:
             Candidate(name="Daniel Paget", stage=Stage.DISCOUNTED, role="Chief Operating Officer", company="IDHL", status="Not open to a move"),
         ],
     )
+    # convert each profile candidate's flat career list into company groups
+    for c in a.candidates:
+        if c.career:
+            c.career = _group(c.career)
+    return a

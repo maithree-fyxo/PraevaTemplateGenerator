@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class Stage(str, Enum):
@@ -24,18 +24,23 @@ class Stage(str, Enum):
 
 @dataclass
 class CareerEntry:
-    """One row of a candidate's career-history table.
-
-    left  = company (line 1) + role (line 2)  -- rendered with a line break
-    dates = "2020 - 2024" (may contain multiple lines for multiple roles)
-    """
-    company: str
+    """One (role, dates) line within a company group."""
     role: str = ""
     dates: str = ""
 
-    @property
-    def left_text(self) -> str:
-        return f"{self.company}\n{self.role}".strip() if self.role else self.company
+
+@dataclass
+class CareerGroup:
+    """A company and the consecutive roles held there, newest first.
+
+    Renders as:
+        Google              (company, bold)
+        Director   2024 - P
+        VP         2022 - 2024
+        Associate  2020 - 2022
+    """
+    company: str
+    roles: List[CareerEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -50,11 +55,12 @@ class Candidate:
 
     # --- Profile-slide fields (engaged & some discounted) ---
     has_profile: bool = False
+    name_url: str = ""        # LinkedIn URL -> name becomes a hyperlink on profile slides
     salary: str = ""          # "£220,000 base, bonus, LTIP"
     location: str = ""        # "London, open to commuting"
     availability: str = ""    # "4 months" / "Immediately available" / "TBC"
     education: str = ""       # free text; tabs/newlines preserved
-    career: List[CareerEntry] = field(default_factory=list)
+    career: List[CareerGroup] = field(default_factory=list)
 
 
 @dataclass

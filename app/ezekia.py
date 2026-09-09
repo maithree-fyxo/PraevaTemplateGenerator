@@ -48,7 +48,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from . import config
-from .models import Assignment, Candidate, CareerEntry, Stage
+from .models import Assignment, Candidate, CareerEntry, CareerGroup, Stage
 from .mock_data import mock_assignment
 
 # --------------------------------------------------------------------------- #
@@ -465,11 +465,12 @@ def _map_candidate(person: Dict[str, Any]) -> Optional[Candidate]:
         company=_position_company(current),
         status=status_label,
         has_profile=has_profile,
+        name_url=_linkedin_url(person, profile),
         salary=_salary(profile),
         location=_location(person, profile),
         availability=_availability(profile),
         education=_education(profile.get("education", [])),
-        career=_career(positions),
+        career=_career_groups(positions),
     )
     cand.__dict__["_rank"] = (_g(person, "meta", "candidate", "rank", default=None)
                               if _g(person, "meta", "candidate", "rank", default=None) is not None
@@ -486,36 +487,49 @@ def _position_company(pos: Dict[str, Any]) -> str:
     return ""
 
 
-def _career(positions: List[Dict[str, Any]]) -> List[CareerEntry]:
-    out = []
+def _position_dates(p: Dict[str, Any]) -> str:
+    start = _year(p.get("startDate"))
+    end = _year(p.get("endDate"))
+    # Ezekia encodes an open-ended (current) role as year 9999 -> show "P".
+    if end == "9999":
+        end = "P"
+    elif not end and (p.get("tense") or p.get("primary")):
+        end = "P"
+    return f"{start} - {end}".strip(" -") if (start or end) else ""
+
+
+def _career_groups(positions: List[Dict[str, Any]]) -> List[CareerGroup]:
+    """Group CONSECUTIVE positions at the same company into one block, so a
+    person who held several roles at one employer shows the company once with
+    each role beneath it. Non-consecutive spells at the same company stay
+    separate (they represent a return after time elsewhere)."""
+    groups: List[CareerGroup] = []
     for p in positions:
-        start = _year(p.get("startDate"))
-        end = _year(p.get("endDate"))
-        # Ezekia encodes an open-ended (current) role as year 9999 -> show "P".
-        if end == "9999":
-            end = "P"
-        elif not end and (p.get("tense") or p.get("primary")):
-            end = "P"
-        dates = f"{start} - {end}".strip(" -") if (start or end) else ""
-        out.append(CareerEntry(
-            company=_position_company(p),
-            role=p.get("title") or "",
-            dates=dates,
-        ))
-    return out
+        company = _position_company(p)
+        entry = CareerEntry(role=p.get("title") or "", dates=_position_dates(p))
+        if groups and groups[-1].company.strip().lower() == company.strip().lower():
+            groups[-1].roles.append(entry)
+        else:
+            groups.append(CareerGroup(company=company, roles=[entry]))
+    return groups
 
 
 def _education(edu: List[Dict[str, Any]]) -> str:
+    """Show only the FIRST education record (per Praeva)."""
+    if not edu:
+        return ""
+    e = edu[0] if isinstance(edu[0], dict) else {}
+    school = e.get("school") or e.get("institution") or e.get("name") or ""
+    start = _year(e.get("startDate"))
+    end = _year(e.get("endDate"))
+    years = f"{start} - {end}".strip(" -") if (start or end) else ""
     lines = []
-    for e in edu:
-        school = e.get("school") or ""
-        start = _year(e.get("startDate"))
-        end = _year(e.get("endDate"))
-        years = f"{start} - {end}".strip(" -") if (start or end) else ""
-        lines.append(f"{school}\t{years}".rstrip("\t "))
-        deg = ", ".join(x for x in (e.get("degree"), e.get("field")) if x)
-        if deg:
-            lines.append(deg)
+    header = f"{school}\t{years}".rstrip("\t ") if school or years else ""
+    if header:
+        lines.append(header)
+    deg = ", ".join(x for x in (e.get("degree"), e.get("field")) if x)
+    if deg:
+        lines.append(deg)
     return "\n".join(lines)
 
 
@@ -532,17 +546,59 @@ def _salary(profile: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+def _linkedin_url(person: Dict[str, Any], profile: Dict[str, Any]) -> str:
+    """Find the candidate's LinkedIn URL among their links / social handles."""
+    pools = []
+    for src in (person.get("links"), _g(profile, "links"),
+                person.get("socialLinks"), person.get("social"),
+                _g(profile, "socialLinks")):
+        if isinstance(src, list):
+            pools.extend(src)
+    for item in pools:
+        if isinstance(item, str):
+            if "linkedin" in item.lower():
+                return item.strip()
+            continue
+        if isinstance(item, dict):
+            url = (item.get("url") or item.get("href") or item.get("link")
+                   or item.get("value") or item.get("address") or "")
+            typ = (item.get("type") or item.get("platform") or item.get("name")
+                   or item.get("label") or item.get("network") or "")
+            if isinstance(url, str) and "linkedin" in url.lower():
+                return url.strip()
+            if (isinstance(typ, str) and "linkedin" in typ.lower()
+                    and isinstance(url, str) and url.strip()):
+                return url.strip()
+    return ""
+
+
+# location values Ezekia returns when a candidate's location is set to private
+_PRIVATE_LOC = {"private", "confidential", "hidden", "undisclosed"}
+
+
+def _is_private_loc(d: Any) -> bool:
+    if isinstance(d, dict):
+        for flag in ("private", "isPrivate", "confidential", "hidden"):
+            if d.get(flag) is True:
+                return True
+    return False
+
+
 def _loc_str(d: Any) -> str:
     """Render a location value (string or dict) to a display string.
     Handles both a named location ({name:...}) and a structured address
-    ({city, region, country, ...}) -> "City, Country"."""
+    ({city, region, country, ...}) -> "City, Country". Returns "" for a
+    location the candidate has marked private."""
+    if _is_private_loc(d):
+        return ""
     if isinstance(d, str):
-        return d.strip()
+        s = d.strip()
+        return "" if s.lower() in _PRIVATE_LOC else s
     if isinstance(d, dict):
         for key in ("name", "formatted", "label", "displayName", "fullName"):
             v = d.get(key)
             if isinstance(v, str) and v.strip():
-                return v.strip()
+                return "" if v.strip().lower() in _PRIVATE_LOC else v.strip()
         # compose from structured parts
         parts = [d.get("city") or d.get("town"),
                  d.get("region") or d.get("state") or d.get("county"),
@@ -716,6 +772,57 @@ def _profile_field_probe(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _person_shape_probe(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """For the first FULL-PROFILE candidate, report key paths of links /
+    currentStatus / education so we can confirm where LinkedIn lives and why a
+    location may be private. KEY PATHS ONLY — no personal values."""
+    sample = None
+    for it in items:
+        r = _candidate_route(it)
+        if r is not None and r[2]:
+            sample = it
+            break
+    if sample is None:
+        return {"note": "no full-profile candidate found"}
+    prof = sample.get("profile") or {}
+    cur_locs = _g(prof, "currentStatus", "locations", default=[]) or []
+    first_loc = cur_locs[0] if cur_locs and isinstance(cur_locs[0], dict) else None
+    return {
+        "links_paths": _key_paths(sample.get("links") or [])[:20],
+        "currentStatus_paths": _key_paths(_g(prof, "currentStatus", default={}) or {})[:30],
+        "education_paths": _key_paths(_g(prof, "education", default=[]) or [])[:30],
+        "linkedin_found": bool(_linkedin_url(sample, prof)),
+        "location_found": bool(_location(sample, prof)),
+        "first_location_marked_private": _is_private_loc(first_loc),
+    }
+
+
+def _profile_fill_summary(items: List[Dict[str, Any]]) -> Dict[str, int]:
+    """How many FULL-PROFILE candidates have each field populated (after
+    enrichment). Counts only — pinpoints e.g. education missing for some."""
+    out = {"profile_candidates": 0, "linkedin": 0, "location": 0,
+           "salary": 0, "notice": 0, "education": 0, "career": 0}
+    for it in items:
+        r = _candidate_route(it)
+        if r is None or not r[2]:
+            continue
+        out["profile_candidates"] += 1
+        prof = it.get("profile") or {}
+        if _linkedin_url(it, prof):
+            out["linkedin"] += 1
+        if _location(it, prof):
+            out["location"] += 1
+        if _salary(prof):
+            out["salary"] += 1
+        if _availability(prof):
+            out["notice"] += 1
+        if _education(prof.get("education", []) or []):
+            out["education"] += 1
+        if prof.get("positions"):
+            out["career"] += 1
+    return out
+
+
 def diagnose(url: str) -> Dict[str, Any]:
     """Report the STRUCTURE of what Ezekia returns for a URL, to debug empty
     results. Safe: returns statuses, key names, counts and pipeline-tag texts —
@@ -805,7 +912,8 @@ def diagnose(url: str) -> Dict[str, Any]:
             # merge pipeline tags, then enrich a SAMPLE of profile candidates via
             # the v4 person endpoint (one field per call), exactly like production
             items = _merge_meta(items, [{"id": k, "meta": v} for k, v in meta_by_id.items()])
-            out["person_enrich"] = _enrich_profile_candidates(client, BASE_URL, items, limit=5)
+            # enrich ALL profile candidates so the probe reflects the real deck
+            out["person_enrich"] = _enrich_profile_candidates(client, BASE_URL, items)
             cand_info["raw_count"] = len(items)
             cand_info["merged_with_tags"] = len(meta_by_id)
             # where do pipeline tags live? sample first item's key paths
@@ -836,9 +944,13 @@ def diagnose(url: str) -> Dict[str, Any]:
                     elif stage == Stage.DISCOUNTED: routed["discounted_table"] += 1
             cand_info["pipeline_tags_seen"] = tag_census
             cand_info["routed_counts"] = routed
-            # confirm the enriched blocks now populate (only the sampled profile
-            # candidates carry currentStatus/confidential after enrichment)
+            # confirm the enriched blocks now populate across profile candidates
             out["profile_field_probe"] = _profile_field_probe(items)
+            # structure of one profile candidate: confirms LinkedIn field + the
+            # private-location cause + education shape (KEY PATHS only, no values)
+            out["person_shape"] = _person_shape_probe(items)
+            # how many profile candidates ended up with each field populated
+            out["profile_fill_summary"] = _profile_fill_summary(items)
         else:
             cand_info["body_snippet"] = cr.text[:200]
         out["candidates"] = cand_info
