@@ -129,16 +129,26 @@ def generate(req: GenerateRequest):
     except ezekia.EzekiaError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    out_path = os.path.join("/tmp", _safe_filename(assignment.name))
+    fname = _safe_filename(assignment.name)
+    out_path = os.path.join("/tmp", fname)
     try:
         pptx_engine.generate(assignment, TEMPLATE_PATH, out_path)
     except Exception as e:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"Failed to build deck: {e}")
 
+    # Set Content-Disposition explicitly with a simple quoted filename so the
+    # browser keeps the full "Praeva Search Update - <company> - <date>.pptx"
+    # name. (Starlette's FileResponse switches to the filename*=utf-8'' form
+    # when the name has spaces, which the frontend then can't parse.)
+    from urllib.parse import quote
+    headers = {
+        "Content-Disposition": f'attachment; filename="{fname}"; '
+                               f"filename*=UTF-8''{quote(fname)}"
+    }
     return FileResponse(
         out_path,
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        filename=os.path.basename(out_path),
+        headers=headers,
     )
 
 

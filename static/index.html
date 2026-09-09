@@ -164,10 +164,14 @@ async function generate(){
     if(!r.ok){ const d = await r.json().catch(()=>({})); showErr(d.detail||"Generation failed"); return; }
     const blob = await r.blob();
     const cd = r.headers.get("Content-Disposition")||"";
-    const m = cd.match(/filename="?([^"]+)"?/);
+    let name = "Praeva Search Update.pptx";
+    const star = cd.match(/filename\*=(?:UTF-8'')?([^;]+)/i);
+    const plain = cd.match(/filename="([^"]+)"/i) || cd.match(/filename=([^;]+)/i);
+    if (star) { try { name = decodeURIComponent(star[1].trim().replace(/"/g,"")); } catch(e){ name = star[1]; } }
+    else if (plain) { name = plain[1].trim(); }
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = m ? m[1] : "search-update.pptx";
+    a.download = name;
     document.body.appendChild(a); a.click(); a.remove();
   }catch(e){ showErr("Could not reach the server."); }
   finally{ btn.disabled=false; btn.textContent="Generate PowerPoint"; }

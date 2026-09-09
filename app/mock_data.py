@@ -107,6 +107,19 @@ def mock_assignment() -> Assignment:
                     _c("Eight Partnership", "Account Manager", "2012 - 2013"),
                 ],
             ),
+            Candidate(
+                name="Priya Anand", stage=Stage.DISCOUNTED, has_profile=True,
+                name_url="https://www.linkedin.com/in/priya-anand",
+                role="Chief Operating Officer", company="Northgate", status="Counter-offered",
+                salary="£165,000 base, 30% bonus",
+                location="Manchester", availability="3 months",
+                education="University of Manchester\t2005 - 2008\nBSc, Economics",
+                career=[
+                    _c("Northgate", "Chief Operating Officer", "2022 - P"),
+                    _c("Northgate", "Operations Director", "2020 - 2022"),
+                    _c("Sky", "Head of Ops", "2016 - 2020"),
+                ],
+            ),
             # -------- Discounted table ("Not Interested") --------
             Candidate(name="Lee Avery-Jones", stage=Stage.DISCOUNTED, role="Chief Operating Officer", company="Amplify", status="Not open to a move"),
             Candidate(name="Rhoda Sell", stage=Stage.DISCOUNTED, role="Chief Operating Officer", company="Automated Creative", status="Waiting for exit"),

@@ -378,8 +378,9 @@ def _fill_profile_column(slots_col: dict, cand: Optional[Candidate]):
         return
 
     put("name", cand.name)
-    if cand.name_url:
-        _hyperlink_shape(slots_col.get("name"), cand.name_url)
+    # always (re)set the name hyperlink — clears any stale link cloned from the
+    # template's sample profile, then applies this candidate's LinkedIn if any
+    _hyperlink_shape(slots_col.get("name"), cand.name_url)
     put("location", cand.location)
     put("salary", cand.salary)
     put("availability", cand.availability)
@@ -389,9 +390,23 @@ def _fill_profile_column(slots_col: dict, cand: Optional[Candidate]):
         _fill_career_table(tbl, cand.career)
 
 
+def _clear_hyperlinks(text_frame):
+    """Remove any hyperlink cloned from the template's sample content."""
+    for para in text_frame.paragraphs:
+        for r in para.runs:
+            try:
+                r.hyperlink.address = None
+            except Exception:
+                pass
+
+
 def _hyperlink_shape(shape, url: str):
-    """Make the first run of a text shape a hyperlink to `url`."""
-    if shape is None or not url or not shape.has_text_frame:
+    """Clear any stale hyperlink on a text shape, then link its first run to
+    `url` (a falsy url just clears)."""
+    if shape is None or not shape.has_text_frame:
+        return
+    _clear_hyperlinks(shape.text_frame)
+    if not url:
         return
     for para in shape.text_frame.paragraphs:
         if para.runs:
@@ -435,12 +450,29 @@ def _mask_empty_right_slot(slide):
     rect.shadow.inherit = False
 
 
+def _remove_stray_right_masks(slide):
+    """Remove any template artefact rectangle sitting over the RIGHT column's
+    lower area (e.g. the discounted slide's "Rectangle 49" that covers the 2nd
+    profile's education). Only no-text auto-shapes low on the right are removed,
+    so real card decorations and labels are left untouched."""
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    for sh in list(slide.shapes):
+        try:
+            is_auto = sh.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE
+            has_text = sh.has_text_frame and sh.text_frame.text.strip()
+            if is_auto and not has_text and _column_of(sh) == "right" and _in(sh.top) > 5.5:
+                sh._element.getparent().remove(sh._element)
+        except Exception:
+            pass
+
+
 def fill_profile_slide(slide, left_cand: Optional[Candidate], right_cand: Optional[Candidate]):
     slots = _profile_slots(slide)
     _fill_profile_column(slots["left"], left_cand)
     if right_cand is None:
         _mask_empty_right_slot(slide)
     else:
+        _remove_stray_right_masks(slide)
         _fill_profile_column(slots["right"], right_cand)
 
 
@@ -477,6 +509,23 @@ def fill_list_table(table_shape, candidates: List[Candidate]):
         values = [cand.name, cand.role, cand.company, cand.status]
         for c in range(min(4, len(table.columns))):
             set_cell_text(table.cell(i, c), values[c])
+            # clear any hyperlink cloned from the template's sample row
+            _clear_hyperlinks(table.cell(i, c).text_frame)
+        # hyperlink the NAME cell to this candidate's LinkedIn (if any)
+        _hyperlink_cell(table.cell(i, 0), cand.name_url)
+
+
+def _hyperlink_cell(cell, url: str):
+    """Link the first run of a table cell to `url` (falsy url leaves it plain)."""
+    if not url:
+        return
+    for para in cell.text_frame.paragraphs:
+        if para.runs:
+            try:
+                para.runs[0].hyperlink.address = url
+            except Exception:
+                pass
+            return
 
 
 def placeholder_list_table(table_shape, rows: int = 5):
