@@ -1,5 +1,11 @@
 # Render blueprint — deploys this repo as a web service.
 # In the Render dashboard: New + > Blueprint > pick your GitHub repo.
+#
+# The Angular frontend is pre-built and committed under frontend/dist, so the
+# Python runtime below serves it with no Node build step. If you change the
+# frontend, rebuild it (cd frontend && npm ci && npm run build) and commit, OR
+# deploy with the Docker runtime (see Dockerfile) which builds Angular fresh —
+# switch the two commented lines below to use it.
 services:
   - type: web
     name: praeva-template-generator
@@ -7,6 +13,9 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # For fresh Angular builds on deploy, use Docker instead of the two lines above:
+    #   runtime: docker
+    #   dockerfilePath: ./Dockerfile
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.4"

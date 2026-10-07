@@ -32,7 +32,11 @@ from . import config, ezekia, pptx_engine, excel_ingest
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "praeva_search_update.pptx")
-STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+# Serve the built Angular app if present, otherwise fall back to the legacy
+# static HTML (keeps the app working whether or not the frontend was built).
+_ANGULAR_DIR = os.path.join(BASE_DIR, "frontend", "dist", "frontend", "browser")
+STATIC_DIR = _ANGULAR_DIR if os.path.isdir(_ANGULAR_DIR) else os.path.join(BASE_DIR, "static")
 
 app = FastAPI(title="Praeva Template Generator")
 

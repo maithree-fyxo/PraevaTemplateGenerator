@@ -517,9 +517,9 @@ def _position_dates(p: Dict[str, Any]) -> str:
     end = _year(p.get("endDate"))
     # Ezekia encodes an open-ended (current) role as year 9999 -> show "P".
     if end == "9999":
-        end = "P"
+        end = "present"
     elif not end and (p.get("tense") or p.get("primary")):
-        end = "P"
+        end = "present"
     return f"{start} - {end}".strip(" -") if (start or end) else ""
 
 

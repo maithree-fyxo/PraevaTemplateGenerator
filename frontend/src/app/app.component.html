@@ -1,0 +1,163 @@
+<div class="app">
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">P</div>
+      <div class="brand-text">
+        <span class="brand-name">Praeva</span>
+        <span class="brand-sub">Template Generator</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="env-pill" *ngIf="cfg?.mock_mode">Demo mode</span>
+      <button class="icon-btn" type="button" (click)="settingsOpen = !settingsOpen" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 8 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H2a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 3.6 8a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H8a1.65 1.65 0 0 0 1-1.51V2a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V8a1.65 1.65 0 0 0 1.51 1H22a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+        <span>Settings</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="content">
+    <div class="page-head">
+      <h1>Generate a deck</h1>
+      <p>Choose a template, then generate it from a live Ezekia assignment or an Excel export.</p>
+    </div>
+
+    <!-- Template selector -->
+    <section class="card">
+      <div class="field">
+        <label for="template">Template</label>
+        <div class="select-wrap">
+          <select id="template" [(ngModel)]="selectedTemplateId">
+            <option *ngFor="let t of templates" [value]="t.id" [disabled]="!t.available">
+              {{ t.name }}{{ t.available ? '' : ' (coming soon)' }}
+            </option>
+          </select>
+        </div>
+        <p class="hint">{{ selectedTemplate.description }}</p>
+      </div>
+    </section>
+
+    <!-- Source tabs -->
+    <div class="tabs">
+      <button type="button" [class.active]="source === 'ezekia'" (click)="source = 'ezekia'">From Ezekia</button>
+      <button type="button" [class.active]="source === 'excel'" (click)="source = 'excel'">From Excel</button>
+    </div>
+
+    <!-- Ezekia source -->
+    <section class="card" *ngIf="source === 'ezekia'">
+      <div class="field">
+        <label for="url">Ezekia assignment URL</label>
+        <div class="row">
+          <input id="url" type="text" [(ngModel)]="url" (keydown.enter)="runPreview()"
+                 placeholder="https://ezekia.com/#/assignments/12345/info" autocomplete="off" />
+          <button class="btn ghost" type="button" (click)="runPreview()" [disabled]="previewing">
+            {{ previewing ? 'Loading…' : 'Preview' }}
+          </button>
+        </div>
+      </div>
+
+      <div class="banner" *ngIf="cfg?.mock_mode">
+        Running in <b>demo mode</b> with sample data — add your Ezekia key in Settings to fetch live assignments.
+      </div>
+      <div class="alert" *ngIf="err">{{ err }}</div>
+
+      <div class="panel" *ngIf="preview">
+        <div class="panel-meta">
+          <div><span>Assignment</span><b>{{ preview.assignment || '—' }}</b></div>
+          <div><span>Title</span><b>{{ preview.title || '—' }}</b></div>
+          <div><span>Date</span><b>{{ preview.date || '—' }}</b></div>
+        </div>
+        <div class="chips">
+          <span class="chip" *ngFor="let c of chips(preview)">{{ c.k }}<b>{{ c.v }}</b></span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn primary" type="button" (click)="generate()" [disabled]="generating">
+          <span class="spinner" *ngIf="generating"></span>{{ generating ? 'Generating…' : 'Generate PowerPoint' }}
+        </button>
+        <button class="btn ghost" type="button" (click)="runDiagnose()">Diagnose</button>
+      </div>
+
+      <pre class="diag" *ngIf="diagOpen">{{ diagOut }}</pre>
+    </section>
+
+    <!-- Excel source -->
+    <section class="card" *ngIf="source === 'excel'">
+      <p class="hint gap">Upload the Ezekia <b>Project Candidate Report</b> export. No API key required.</p>
+      <div class="field">
+        <label>Project Candidate Report (.xlsx)</label>
+        <div class="row">
+          <label class="file-btn">
+            <input type="file" accept=".xlsx" (change)="onFile($event)" hidden />
+            Choose file
+          </label>
+          <span class="file-name">{{ fileName || 'No file selected' }}</span>
+          <button class="btn ghost" type="button" (click)="runXlsxPreview()" [disabled]="xlsxPreviewing">
+            {{ xlsxPreviewing ? 'Loading…' : 'Preview' }}
+          </button>
+        </div>
+      </div>
+
+      <div class="alert" *ngIf="xlsxErr">{{ xlsxErr }}</div>
+
+      <div class="panel" *ngIf="xlsxPreview">
+        <div class="panel-meta">
+          <div><span>Assignment</span><b>{{ xlsxPreview.assignment || '—' }}</b></div>
+          <div><span>Title</span><b>{{ xlsxPreview.title || '—' }}</b></div>
+          <div><span>Date</span><b>{{ xlsxPreview.date || '—' }}</b></div>
+        </div>
+        <div class="chips">
+          <span class="chip" *ngFor="let c of chips(xlsxPreview)">{{ c.k }}<b>{{ c.v }}</b></span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn primary" type="button" (click)="xlsxGenerate()" [disabled]="xlsxGenerating">
+          <span class="spinner" *ngIf="xlsxGenerating"></span>{{ xlsxGenerating ? 'Generating…' : 'Generate PowerPoint' }}
+        </button>
+      </div>
+    </section>
+
+    <p class="foot">Fills only candidate-driven slides. Executive summary and target landscape are left for manual editing.</p>
+  </main>
+
+  <!-- Settings drawer -->
+  <div class="drawer-scrim" *ngIf="settingsOpen" (click)="settingsOpen = false"></div>
+  <aside class="drawer" [class.open]="settingsOpen">
+    <div class="drawer-head">
+      <h2>Settings</h2>
+      <button class="icon-btn plain" type="button" (click)="settingsOpen = false" aria-label="Close">✕</button>
+    </div>
+    <div class="drawer-body">
+      <h3>Ezekia API key</h3>
+      <div class="status-line">
+        <span>Status</span>
+        <b *ngIf="cfg?.token_configured">Configured&nbsp; {{ cfg?.token_hint }}</b>
+        <b *ngIf="!cfg?.token_configured" class="muted">Not configured</b>
+      </div>
+      <div class="status-line">
+        <span>Source</span>
+        <b class="muted">{{ cfg?.token_source === 'env' ? 'environment variable' : (cfg?.token_source === 'config' ? 'saved in app' : '—') }}</b>
+      </div>
+
+      <label class="mt">Add / replace key</label>
+      <input type="password" [(ngModel)]="tokenInput" (keydown.enter)="saveToken()"
+             placeholder="Paste Ezekia API token" autocomplete="off" />
+      <p class="hint">Stored write-only on the server. It's never shown or sent back to the browser.</p>
+
+      <div class="cfg-msg" *ngIf="cfgMsg">{{ cfgMsg }}</div>
+      <div class="alert" *ngIf="cfgErr">{{ cfgErr }}</div>
+
+      <div class="drawer-actions">
+        <button class="btn primary" type="button" (click)="saveToken()" [disabled]="cfgBusy">Save</button>
+        <button class="btn ghost" type="button" (click)="testToken()">Test connection</button>
+        <button class="btn danger" type="button" (click)="clearToken()" [disabled]="cfgBusy">Clear key</button>
+      </div>
+    </div>
+  </aside>
+</div>

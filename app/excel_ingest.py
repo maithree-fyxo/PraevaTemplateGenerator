@@ -66,15 +66,15 @@ def _route_from_tag(tag: str):
 
 def _fmt_dates(start: Any, end: Any) -> str:
     """Build 'YYYY - YYYY' from the export's start/end (e.g. '2025/10/01').
-    An open-ended role — end 'Present'/'Current' or 9999 — shows 'P'."""
+    An open-ended role — end 'Present'/'Current' or 9999 — shows 'present'."""
     s = ezekia._year(start)
     end_raw = "" if end is None else str(end).strip()
     if end_raw.lower() in ("present", "current", "ongoing") or end_raw == "9999":
-        e = "P"
+        e = "present"
     else:
         e = ezekia._year(end)
         if e == "9999":
-            e = "P"
+            e = "present"
     return f"{s} - {e}".strip(" -") if (s or e) else ""
 
 
